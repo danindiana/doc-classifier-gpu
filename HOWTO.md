@@ -36,16 +36,19 @@ training_root/
 Minimum ~15 documents per class for reliable CV accuracy. Supported formats:
 `.pdf`, `.jpg`, `.png`, `.webp`, `.txt`, `.md`, `.docx`, `.rtf`, `.eml`, `.xml`, `.html`
 
-### Launch training (in a visible xterm)
+### Launch training (in alacritty — supports clipboard copy)
 
 ```bash
-DISPLAY=:0 xterm -title "training" -fa 'Monospace' -fs 11 -geometry 130x55 -e bash -c '
+DISPLAY=:0 alacritty --title "doc_classifier_gpu — training" -e bash -c '
 source ~/doc-clf-gpu-env/bin/activate
 cd ~/Documents/claude_creations/2026-05-30_092836_doc-classifier-gpu
 python doc_classifier_gpu.py train /path/to/corpus -m my_model.joblib
-echo; echo "--- done --- press Enter ---"; read
+echo; echo "--- done (exit $?) --- press Enter ---"; read
 ' &
 ```
+
+Mouse-select any text in alacritty to copy it to clipboard. Use xfce4-terminal or
+gnome-terminal as alternatives. Avoid xterm — it has no clipboard copy support.
 
 The script automatically selects the GPU with the most free VRAM. No need to set
 `CUDA_VISIBLE_DEVICES` manually — `_pick_device()` handles it.
@@ -146,14 +149,35 @@ python sort_docs.py /path/to/source/ \
 Source files stay in place; `sorted/` contains symlinks. Requires the source
 volume to remain mounted.
 
+### Recommended flags for large collections (thousands of files)
+
+```bash
+python sort_docs.py /path/to/source/ \
+    --model militia.joblib \
+    --output ./sorted \
+    --mode report \
+    --threshold 0.40 \
+    --skip-ocr \
+    --encode-batch 32 \
+    --no-single-gpu
+```
+
+`--skip-ocr` skips GPU OCR (sends image-only PDFs to `_review/`) and runs ~10× faster.
+`--no-single-gpu` activates dual-GPU subprocess mode — both RTX 5080 + RTX 3080 embed
+simultaneously via process isolation, ~2× throughput with no heap corruption risk.
+
 ### sort_docs.py flags
 
 | Flag | Default | Notes |
 |------|---------|-------|
 | `--mode` | `copy` | `copy` \| `symlink` \| `report` |
 | `--threshold` | `0.40` | Files below this confidence → `_review/` |
-| `--workers` | `cpu_count-2` | Parallel CPU extraction workers |
-| `--batch` | `256` | Documents per GPU embedding batch |
+| `--workers` | `cpu_count-2` | Parallel CPU extraction processes |
+| `--maxtasks` | `50` | Pool maxtasksperchild; `1` = max crash isolation |
+| `--batch` | `512` | Documents per GPU embedding window |
+| `--encode-batch` | `32` | GPU forward-pass chunk batch; keep ≤64 for bge-m3 on 16 GB |
+| `--skip-ocr` | off | Image-only files → `_review/`; ~10× faster for bulk runs |
+| `--no-single-gpu` | off | Dual-GPU subprocess mode — both GPUs embed in parallel |
 
 ---
 
@@ -179,18 +203,38 @@ Higher weight norm = more distinctive class in embedding space.
 
 ## 7. Two GPUs simultaneously
 
-Training on GPU 0 + classification on GPU 1 works automatically:
+### Option A — Different workloads on each GPU (auto)
+
+`doc_classifier_gpu.py` and `sort_docs.py` both call `_pick_device()` which probes
+free VRAM and picks the GPU with the most headroom. If training occupies GPU 0,
+the sort run automatically lands on GPU 1. No `CUDA_VISIBLE_DEVICES` needed.
 
 ```bash
-# Terminal 1: training (auto-selects GPU 0 if free)
+# Terminal 1: training (auto-selects GPU 0)
 python doc_classifier_gpu.py train /corpus -m model.joblib
 
-# Terminal 2: sort run (auto-selects GPU 1 when GPU 0 is busy)
-python sort_docs.py /source -m model.joblib --output ./sorted --mode report
+# Terminal 2: sort run (auto-selects GPU 1 when GPU 0 busy)
+python sort_docs.py /source -m model.joblib --output ./sorted --mode report --skip-ocr
 ```
 
-The `_pick_device()` function probes free VRAM on all GPUs and picks the best one.
-No `CUDA_VISIBLE_DEVICES` needed.
+### Option B — Both GPUs for the same sort run (`--no-single-gpu`)
+
+```bash
+python sort_docs.py /path/to/source/ -m militia.joblib \
+  --output ./sorted --mode report \
+  --skip-ocr --encode-batch 32 --no-single-gpu
+```
+
+This spawns two independent Python subprocesses via `mp.get_context('spawn')` —
+one on `cuda:0` (RTX 5080), one on `cuda:1` (RTX 3080). Each loads bge-m3 in its
+own heap (preventing the glibc corruption that occurred when loading twice in one
+process). Batches of documents are round-robined between the two subprocesses.
+
+**Verified result:** RTX 5080 at 88%, RTX 3080 at 100%; ~5,200 MiB each (vs ~13,400 MiB
+single-GPU). Throughput is approximately 2× compared to single-GPU mode.
+
+**Note:** Both bge-m3 instances must fit in VRAM simultaneously. RTX 3080 has 10 GB —
+confirmed sufficient at `--encode-batch 32`.
 
 ---
 
@@ -198,12 +242,16 @@ No `CUDA_VISIBLE_DEVICES` needed.
 
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
-| `torch.OutOfMemoryError` at model load | GPU busy (training running) | Script now auto-selects next GPU |
-| `BrokenProcessPool` | C extension segfault in worker (old pdfplumber code) | Use v10+ code (PyMuPDF) |
-| `(skipped)` for most files | Scanned PDFs, no text layer | EasyOCR handles these via GPU OCR |
-| Many `worker error — retrying sequentially` | Old pdfplumber code on image-heavy PDFs | Upgrade to v10 (PyMuPDF) |
-| `console.print` TypeError in except block | `stderr=True` is not a rich param | Already fixed in v9 |
-| `._filename` files crashing EasyOCR | macOS resource forks in file list | Already filtered in v9 |
+| `torch.OutOfMemoryError` at model load | GPU busy (training running) | `_pick_device()` auto-selects next GPU |
+| `torch.OutOfMemoryError` in embed thread | `--encode-batch` too large | Use `--encode-batch 32`; OOM recovery halves it automatically |
+| `BrokenProcessPool` in training | C extension segfault in worker (old pdfplumber) | Current code uses PyMuPDF — no Pillow exposure |
+| `BrokenPipeError` cascade in sort_docs | `imap_unordered` + `WorkerLostError` kills pool | Restart loop already in current code; update if using old version |
+| Heap corruption loading dual bge-m3 | Two `SentenceTransformer` loads in one process | Use `--no-single-gpu` (subprocess isolation via `spawn`) |
+| Can't copy errors from terminal | xterm has no clipboard copy | Use alacritty (mouse-select → clipboard) |
+| `(skipped)` for most files | Scanned PDFs, no text layer | Add `--max-ocr-pages 3` for sample OCR, or accept `_review/` |
+| Many `worker error — retrying sequentially` | Old pdfplumber on image-heavy PDFs | Current code uses PyMuPDF — already fixed |
+| `console.print` TypeError in except block | `stderr=True` is not a rich param | Already fixed |
+| `._filename` files crashing EasyOCR | macOS resource forks in file list | Already filtered |
 | CV accuracy not printed | All classes have < 2 docs (can't split) | Add more training examples |
 | Low accuracy on a class | < 15 docs in that class | Add documents or merge with similar class |
 
@@ -213,18 +261,20 @@ No `CUDA_VISIBLE_DEVICES` needed.
 
 ```
 2026-05-30_092836_doc-classifier-gpu/
-├── doc_classifier_gpu.py   ← main script (v10)
-├── sort_docs.py            ← bulk classifier sorter
-├── wizard.py               ← interactive wizard
-├── militia.joblib          ← trained model (64 classes, run 3)
-├── militia_v8.joblib       ← trained model (v8 code, when complete)
-├── README.md               ← quick-start + badges + diagrams
-├── MILITIA_MODEL.md        ← model internals reference
-├── HOWTO.md                ← this file
-├── SESSION.md              ← session log, incidents, lessons learned
-├── diagrams/               ← architectural Graphviz diagrams
-└── hypersphere/            ← unit hypersphere concept docs + visualizations
+├── doc_classifier_gpu.py           ← main classifier script
+├── sort_docs.py                    ← bulk sort — streaming, dual-GPU, CSV report
+├── wizard.py                       ← interactive training-to-inference wizard
+├── militia.joblib                  ← trained model (64 classes)
+├── militia_v8.joblib               ← trained model (v8 code)
+├── README.md                       ← quick-start + architecture + incident notes
+├── MILITIA_MODEL.md                ← model internals reference
+├── LESSONS_LEARNED.md              ← 14 operational lessons
+├── HOWTO.md                        ← this file
+├── SESSION.md                      ← original session log (2026-05-30)
+├── SESSION_2026-05-30_211956.md    ← resume session log
+├── diagrams/                       ← architectural Graphviz diagrams
+└── hypersphere/                    ← unit hypersphere concept docs + visualizations
     ├── HYPERSPHERE.md
-    ├── hyper[1-5].png      ← matplotlib geometric visualizations
-    └── dot[1-5].png        ← Graphviz architectural diagrams
+    ├── hyper[1-5].png/svg          ← matplotlib geometric visualizations
+    └── dot[1-5].png/svg            ← Graphviz architectural diagrams
 ```

@@ -10,9 +10,9 @@ Usage:
         --workers 24           # parallel CPU extraction processes
         --maxtasks 20          # pool maxtasksperchild (1=max isolation)
         --batch 512            # documents per streaming window
-        --encode-batch 512     # encoder.encode internal GPU batch size
+        --encode-batch 32      # encoder.encode internal GPU batch size (32 safe for bge-m3)
         --skip-ocr             # skip GPU OCR (fast; image files → _review/)
-        --single-gpu           # disable dual-GPU embedding
+        --no-single-gpu        # use both GPUs via subprocess isolation (~2× throughput)
 
 Output:
     sorted_output/

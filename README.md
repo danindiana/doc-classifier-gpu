@@ -82,28 +82,30 @@ Verified working: `torch 2.13.0.dev20260521+cu130` on driver 580 / CUDA 13.0.
 
 ## GPU stack
 
-Both models are loaded onto GPU 0 at startup and remain resident for the duration of training.
-
 ![GPU Model Stack](diagrams/arch3_gpu_model_stack.png)
 
-| Model | VRAM | Purpose |
-|-------|------|---------|
-| `BAAI/bge-m3` | ~2,200 MiB | Document embedding — 8192-token context, 1024-dim output |
-| EasyOCR (en) | ~200 MiB | OCR for scanned PDFs and image files |
-| **Total in use** | **~9,400 MiB** | of 16,303 MiB available on RTX 5080 |
+| Mode | Model | GPU | VRAM in use | Purpose |
+|------|-------|-----|-------------|---------|
+| Single-GPU (default) | `BAAI/bge-m3` | RTX 5080 | ~13,400 MiB | Embedding + inference |
+| Dual-GPU (`--no-single-gpu`) | `BAAI/bge-m3` × 2 | RTX 5080 + RTX 3080 | ~5,200 MiB each | Parallel embedding (~2× throughput) |
+| Training | `BAAI/bge-m3` + EasyOCR | RTX 5080 | ~9,400 MiB | Embed + OCR |
 
 First run downloads bge-m3 (~2.2 GB) to `~/.cache/huggingface/` and EasyOCR weights
 (~100 MB) to `~/.EasyOCR/`. Both are cached; subsequent runs load from disk.
 
 ---
 
-## GPU pinning
+## GPU selection
 
 Worlock has two GPUs:
-- **GPU 0 — RTX 5080 (16 GB, Blackwell)** — use this one
-- **GPU 1 — RTX 3080 (10 GB)** — display attached, ~557 MiB in use by compositor
+- **GPU 0 — RTX 5080 (16 GB, Blackwell sm_120)** — primary; auto-selected by `_pick_device()`
+- **GPU 1 — RTX 3080 (10 GB)** — secondary; idle during single-GPU runs
 
-Always set `CUDA_VISIBLE_DEVICES=0` so training doesn't compete with the desktop for VRAM.
+`doc_classifier_gpu.py` always auto-selects the GPU with the most free VRAM via
+`_pick_device()` — no `CUDA_VISIBLE_DEVICES` needed. `sort_docs.py` with `--no-single-gpu`
+runs bge-m3 in two isolated subprocesses simultaneously, one per GPU, for ~2× embedding
+throughput. Subprocess isolation (Python `spawn` start method) prevents the glibc heap
+corruption that occurs when two `SentenceTransformer` instances load in the same process.
 
 ---
 
@@ -140,16 +142,18 @@ for CPU-readable files compared to sequential processing.
 
 ```bash
 # Train — sub-folders of training_root become the class labels
-CUDA_VISIBLE_DEVICES=0 python doc_classifier_gpu.py train \
-  /path/to/training_root -m militia.joblib
+python doc_classifier_gpu.py train /path/to/training_root -m militia.joblib
 
-# Classify a single file
-CUDA_VISIBLE_DEVICES=0 python doc_classifier_gpu.py predict \
-  /path/to/new_doc.pdf -m militia.joblib
+# Classify a single file or folder
+python doc_classifier_gpu.py predict /path/to/new_doc.pdf -m militia.joblib
 
-# Classify every file in a folder
-CUDA_VISIBLE_DEVICES=0 python doc_classifier_gpu.py predict \
-  /path/to/unlabelled_folder/ -m militia.joblib
+# Bulk-sort a large collection (single GPU, fast preview)
+python sort_docs.py /path/to/source/ -m militia.joblib \
+  --output ./sorted --mode report --skip-ocr --encode-batch 32
+
+# Bulk-sort using both GPUs (~2× throughput)
+python sort_docs.py /path/to/source/ -m militia.joblib \
+  --output ./sorted --mode report --skip-ocr --encode-batch 32 --no-single-gpu
 ```
 
 Output: top three candidate classes with confidence percentages per file.
@@ -256,18 +260,36 @@ Upgrade path:
 
 ## Incident notes
 
-> **BrokenProcessPool crash — 2026-05-30**
+> **BrokenProcessPool crash — 2026-05-30 (training)**
 >
 > Training on the Liberated_manuals class (706 files) crashed with
 > `concurrent.futures.process.BrokenProcessPool`. Root cause: Pillow's C extension
 > (`_imaging.so`) segfaulted on a corrupt embedded image inside a PDF, killing the worker
 > process and poisoning all pending futures. This was **not OOM** — 101 GB RAM was free.
 >
-> Fixed by adding a two-level exception guard: per-future `try/except` for individual
-> worker failures, plus an outer `except BrokenProcessPool` that collects unfinished files
-> and retries them sequentially. The training run now survives a worker segfault.
+> Fixed: replace pdfplumber with PyMuPDF (`fitz`) for PDF extraction — MuPDF handles
+> embedded images internally without invoking Pillow.
 
 ![BrokenProcessPool Fault Tree](diagrams/incident1_brokenpoolprocess_fault_tree.png)
+
+> **BrokenPipeError cascade — 2026-05-30 (sort_docs.py)**
+>
+> `sort_docs.py` used `pool.imap_unordered()`. When one worker died (fitz SIGSEGV on a
+> corrupt PDF), `WorkerLostError` propagated through the iterator. The `with Pool` block
+> exited, calling `pool.terminate()`, which closed all IPC pipes — every remaining worker
+> got `BrokenPipeError`, flooding stderr with hundreds of tracebacks.
+>
+> Fixed: wrapped the `with Pool` block in a `while files_todo` restart loop that tracks
+> `done_paths`. After each pool exit, only the unprocessed files are retried.
+
+> **bge-m3 OOM — 2026-05-30 (sort_docs.py embed thread)**
+>
+> Default `--encode-batch 512` attempted a forward pass on 512 chunks simultaneously.
+> bge-m3 occupies ~13 GB on the RTX 5080, leaving only ~1.2 GB. The 512-chunk batch
+> needed 2.94 GB → `torch.OutOfMemoryError` in the background embed thread.
+>
+> Fixed: `--encode-batch 32` (default) + OOM recovery loop in `embed_batch()` that
+> halves the batch size on failure until it fits.
 
 ---
 
@@ -282,9 +304,13 @@ Upgrade path:
 | v3 | `d138ab5` | EasyOCR + PyMuPDF GPU OCR. `--workers` flag. `_extract_class()`. |
 | v4 | `d138ab5` | `ProcessPoolExecutor` — true CPU parallelism. **Crashed.** |
 | v5 | `8c0c8a6` | `ThreadPoolExecutor` — wrong fix, GIL serializes pure-Python pdfminer. |
-| v6 | `e2f2d30` | `ProcessPoolExecutor` restored + `BrokenProcessPool` resilience. Insufficient for Liberated_manuals (98% image PDFs). |
+| v6 | `e2f2d30` | `ProcessPoolExecutor` restored + `BrokenProcessPool` resilience. |
 | v7 | `7c4380d` | `rich` TUI: Progress bars, GPU stat lines, Panel headers, summary Table. |
-| v8 | `b0ea134` | **Current.** pdfplumber → PyMuPDF (fitz). `ProcessPoolExecutor` → `Pool(maxtasksperchild=1)`. Eliminates Pillow segfaults. |
+| v8 | `b0ea134` | pdfplumber → PyMuPDF (fitz). `Pool(maxtasksperchild=1)`. Eliminates Pillow segfaults. |
+| sort v1 | `d349d7b` | `sort_docs.py` — streaming `imap_unordered` + background embed thread. |
+| sort v2 | `9ed00e8` | `WorkerLostError` restart loop — BrokenPipeError cascade eliminated. |
+| sort v3 | `9776e6b` | OOM recovery in `embed_batch()`. Default `--encode-batch 32`. |
+| sort v4 | `9ef7e0a` | **Current.** `--no-single-gpu`: dual-GPU via `spawn` subprocess isolation. RTX 5080 + RTX 3080 simultaneously, ~5 GB each, no heap corruption. |
 
 ---
 
@@ -292,15 +318,27 @@ Upgrade path:
 
 ```
 2026-05-30_092836_doc-classifier-gpu/
-├── doc_classifier_gpu.py       # main script (v6)
-├── README.md                   # this file
-├── SESSION.md                  # session log, incidents, resume command
-└── diagrams/
-    ├── arch1_training_pipeline.(dot|png|svg)
-    ├── arch2_extraction_worker_pool.(dot|png|svg)
-    ├── arch3_gpu_model_stack.(dot|png|svg)
-    ├── evol1_script_versions.(dot|png|svg)
-    └── incident1_brokenpoolprocess_fault_tree.(dot|png|svg)
+├── doc_classifier_gpu.py           # main classifier script (v8+)
+├── sort_docs.py                    # bulk sort — streaming pipeline, dual-GPU, CSV report
+├── wizard.py                       # interactive training-to-inference wizard
+├── militia.joblib                  # trained model (64 classes)
+├── militia_v8.joblib               # trained model (v8 code)
+├── README.md                       # this file
+├── HOWTO.md                        # operational how-to guide
+├── MILITIA_MODEL.md                # model internals reference
+├── LESSONS_LEARNED.md              # 14 operational lessons from this project
+├── SESSION.md                      # original session log (2026-05-30)
+├── SESSION_2026-05-30_211956.md    # resume session log
+├── diagrams/
+│   ├── arch1_training_pipeline.(dot|png|svg)
+│   ├── arch2_extraction_worker_pool.(dot|png|svg)
+│   ├── arch3_gpu_model_stack.(dot|png|svg)
+│   ├── evol1_script_versions.(dot|png|svg)
+│   └── incident1_brokenpoolprocess_fault_tree.(dot|png|svg)
+└── hypersphere/
+    ├── HYPERSPHERE.md              # unit hypersphere concept (lay + expert)
+    ├── hyper[1-5].png/svg          # matplotlib geometric visualizations
+    └── dot[1-5].png/svg            # Graphviz architectural diagrams
 ```
 
 Related session: [`../2026-05-30_091736_doc-classifier/`](../2026-05-30_091736_doc-classifier/) — TF-IDF baseline

@@ -265,6 +265,53 @@ while True:
 
 ---
 
+---
+
+## 14. Dual-GPU subprocess isolation — confirmed working
+
+**What happened:** All previous dual-GPU attempts failed with glibc heap corruption
+when `load_encoders()` called `SentenceTransformer(model, device="cuda:0")` then
+`SentenceTransformer(model, device="cuda:1")` in the same process. The second load
+corrupted the HuggingFace tokenizer Rust FFI heap, crashing immediately.
+
+**Root cause:** The Rust FFI layer (`tokenizers` library) maintains global state that
+is not safe to initialize twice in one Python process. This is unrelated to VRAM,
+threading, or CUDA context switching.
+
+**Fix:** Load each encoder in its own subprocess via `mp.get_context('spawn')`.
+`spawn` gives each subprocess a fresh Python interpreter with its own heap — the
+two `SentenceTransformer` instances never share any state:
+
+```python
+ctx = mp.get_context('spawn')
+in_qs  = [ctx.Queue(), ctx.Queue()]
+out_qs = [ctx.Queue(), ctx.Queue()]
+for i in range(2):
+    p = ctx.Process(target=_embed_proc_fn,
+                    args=(in_qs[i], out_qs[i], model, clf_path, ..., f"cuda:{i}"))
+    p.start()
+```
+
+The main process loads only the tiny sklearn classifier (522 KB, no GPU). Batches
+are round-robined between the two subprocess input queues. A collector thread in the
+main process merges result rows from both output queues.
+
+**Verified result (2026-05-30):**
+- RTX 5080 (GPU 0): 88% utilization, ~5,200 MiB
+- RTX 3080 (GPU 1): 100% utilization, ~5,100 MiB
+- No heap corruption, no crash
+- ~2× embedding throughput vs single-GPU
+
+**Key `spawn` vs `fork` distinction:** CUDA's runtime documentation explicitly
+prohibits `fork` after CUDA initialization. `spawn` avoids this by starting a fresh
+interpreter — the child never inherits the parent's CUDA context.
+
+**Rule:** To run multiple `SentenceTransformer` (or any HuggingFace model) instances
+concurrently: use `mp.get_context('spawn')` and spawn one process per model. Never
+load two instances in the same process or via `fork`.
+
+---
+
 ## Summary table
 
 | # | Lesson | Fix |
@@ -282,3 +329,4 @@ while True:
 | 11 | `imap_unordered` + worker crash = BrokenPipeError cascade | Restart loop with `done_paths` tracking |
 | 12 | xterm has no clipboard copy for operator error capture | Use alacritty (mouse-select → clipboard) |
 | 13 | bge-m3 encode-batch=512 OOM on 16 GB GPU | `--encode-batch 32` + OOM recovery loop |
+| 14 | Two SentenceTransformer loads in one process → heap corruption | `mp.get_context('spawn')` subprocess isolation |

@@ -474,10 +474,36 @@ def sort_wizard():
     threshold = Prompt.ask("    --threshold", default="0.60")
 
     # workers / batch
-    default_workers = min(16, max(1, (os.cpu_count() or 4) - 2))
+    default_workers = min(12, max(1, (os.cpu_count() or 4) - 2))
     workers = IntPrompt.ask("  [bold]--workers[/] (CPU extraction)", default=default_workers)
-    batch   = IntPrompt.ask("  [bold]--batch[/] (docs per GPU embedding batch)", default=256)
+    batch   = IntPrompt.ask("  [bold]--batch[/] (docs per embedding window)", default=512)
 
+    # skip-ocr
+    console.print()
+    info("--skip-ocr: image-only PDFs → _review/ instead of GPU OCR. ~10× faster for bulk runs.")
+    skip_ocr = Confirm.ask("  [bold]--skip-ocr[/] (recommended for large collections)", default=True)
+
+    # encode-batch
+    console.print()
+    info("--encode-batch: GPU forward-pass chunk batch size. bge-m3 on 16 GB GPU: keep ≤ 64.")
+    encode_batch = IntPrompt.ask("  [bold]--encode-batch[/]", default=32)
+
+    # dual-GPU
+    console.print()
+    try:
+        import torch as _torch
+        _n_gpus = _torch.cuda.device_count()
+    except Exception:
+        _n_gpus = 0
+    dual_gpu = False
+    if _n_gpus >= 2:
+        info(f"{_n_gpus} GPUs detected. --no-single-gpu runs both simultaneously via subprocess")
+        info("isolation (~2× throughput). bge-m3 must fit on each GPU (~5 GB at encode-batch=32).")
+        dual_gpu = Confirm.ask("  [bold]--no-single-gpu[/] (dual-GPU subprocess mode)", default=True)
+    else:
+        info(f"Only {_n_gpus} GPU(s) detected — single-GPU mode.")
+
+    # build command
     cmd = (
         f"{PYTHON} {SORTER} \"{source}\" "
         f"-m \"{model_path}\" "
@@ -485,17 +511,24 @@ def sort_wizard():
         f"--mode {mode} "
         f"--threshold {threshold} "
         f"--workers {workers} "
-        f"--batch {batch}"
+        f"--batch {batch} "
+        f"--encode-batch {encode_batch}"
     )
+    if skip_ocr:
+        cmd += " --skip-ocr"
+    if dual_gpu:
+        cmd += " --no-single-gpu"
 
     console.print()
     console.print("  Command:\n")
     console.print(Panel(f"[green]{cmd}[/]", border_style="green", padding=(0, 2)))
     console.print()
 
+    gpu_factor = 2 if dual_gpu else 1
+    embed_min = file_count // (1500 * gpu_factor) + 1
     info(f"Estimated time for {file_count:,} files:")
     info(f"  Extraction: ~{file_count // (workers * 60) + 1} min ({workers} workers)")
-    info(f"  Embedding:  ~{file_count // 1500 + 1} min (bge-m3 on GPU)")
+    info(f"  Embedding:  ~{embed_min} min (bge-m3 on {gpu_factor} GPU{'s' if gpu_factor > 1 else ''})")
     info(f"  Output:     {output}")
     console.print()
 
@@ -503,14 +536,13 @@ def sort_wizard():
         console.print("  [dim]Cancelled.[/]")
         return
 
-    xterm_cmd = (
-        f'DISPLAY=:0 xterm -title "sort_docs — {source.name}" '
-        f'-fa "Monospace" -fs 11 -geometry 130x55 '
+    alacritty_cmd = (
+        f'DISPLAY=:0 alacritty --title "sort_docs — {source.name}" '
         f'-e bash -c \'source {VENV_DIR}/bin/activate; {cmd}; '
         f'echo; echo "--- done (exit $?) --- press Enter to close ---"; read\' &'
     )
-    os.system(xterm_cmd)
-    ok("Sort run launched in xterm.")
+    os.system(alacritty_cmd)
+    ok("Sort run launched in alacritty (mouse-select text to copy errors).")
 
     if mode == "report":
         info(f"Results will be in [cyan]{output}/sort_report.csv[/]")
