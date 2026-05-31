@@ -163,6 +163,47 @@ progress bar is advancing, the job is running — ignore the MuPDF noise.
 
 ---
 
+---
+
+## 11. `imap_unordered` + worker crash = BrokenPipeError cascade
+
+**What happened:** `sort_docs.py` used `pool.imap_unordered()`. When one worker crashed
+(SIGSEGV from a corrupt PDF in fitz), Python raised `WorkerLostError` through the iterator.
+The `except Exception` block caught it and fell out of the `with Pool` context manager.
+`pool.__exit__` always calls `pool.terminate()`, which closed all pipe connections. Every
+remaining worker that tried to return a result got `BrokenPipeError`, flooding stderr with
+hundreds of cascading tracebacks.
+
+**Root cause:** `pool.__exit__()` calls `pool.terminate()` unconditionally — there is no
+"exit cleanly" mode. Any early exit from the `with Pool` block (whether via exception or
+normal control flow) terminates all workers immediately.
+
+**Fix:** Wrap the `with Pool` block in a `while files_todo` restart loop. Track
+`done_paths` (set of path strings that returned results) and `fail_counts` (how many
+crashes each path has survived). After each pool exit, restart with only the unfinished
+files. Blacklist files that fail `MAX_FAILS=2` times.
+
+```python
+while files_todo and not _shutdown.is_set():
+    progressed = 0
+    with Pool(...) as pool:
+        try:
+            for path_str, text in pool.imap_unordered(_extract_cpu, files_todo, chunksize=1):
+                done_paths.add(path_str)
+                progressed += 1
+                ...
+        except Exception as exc:
+            console.print(f"⚠ Worker crash: {exc}")
+    files_todo = [p for p in files_todo if p not in done_paths]
+    # (blacklist logic for persistent crashers)
+```
+
+**Rule:** Never use `imap_unordered` inside a bare `with Pool` if a worker crash should be
+survivable. Use a restart loop with done-set tracking, or use `apply_async` with
+`error_callback=` which survives individual crashes without killing the pool.
+
+---
+
 ## Summary table
 
 | # | Lesson | Fix |
@@ -177,3 +218,4 @@ progress bar is advancing, the job is running — ignore the MuPDF noise.
 | 8 | Assumed one GPU at a time | Auto device selection, both GPUs simultaneously |
 | 9 | Full OCR on bulk corpus = 91 hours | `--skip-ocr` or `--max-ocr-pages 3` |
 | 10 | MuPDF stderr output looks like failures | Informational only — check progress bar |
+| 11 | `imap_unordered` + worker crash = BrokenPipeError cascade | Restart loop with `done_paths` tracking |

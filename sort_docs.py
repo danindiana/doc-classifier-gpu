@@ -304,26 +304,61 @@ def main():
         )
         embed_thread.start()
 
-        with Pool(processes=args.workers, maxtasksperchild=args.maxtasks) as pool:
-            try:
-                result_iter = pool.imap_unordered(
-                    _extract_cpu, [str(f) for f in all_files], chunksize=1)
-                for path_str, text in result_iter:  # tight loop — pipe always drained
-                    if _shutdown.is_set():
-                        pool.terminate()
-                        break
-                    f = Path(path_str)
-                    progress.advance(task_extract)
-                    if text.strip():
-                        pending_texts[f] = text
-                    else:
-                        no_text_files.append(f)
-                    # Hand batch to embed thread; never blocks on GPU
-                    if len(pending_texts) >= args.batch:
-                        embed_q.put(dict(pending_texts))
-                        pending_texts = {}
-            except Exception as exc:
-                console.print(f"  [yellow]⚠ Pool error: {exc}[/]")
+        # Restart loop: if a worker crashes (WorkerLostError propagates through
+        # imap_unordered), pool.terminate() is called on __exit__ and other workers
+        # get BrokenPipeError.  We restart a fresh pool for the remaining files.
+        files_todo  = [str(f) for f in all_files]
+        done_paths  = set()
+        fail_counts = Counter()
+        MAX_FAILS   = 2
+
+        while files_todo and not _shutdown.is_set():
+            progressed = 0
+            with Pool(processes=args.workers, maxtasksperchild=args.maxtasks) as pool:
+                try:
+                    for path_str, text in pool.imap_unordered(
+                            _extract_cpu, files_todo, chunksize=1):
+                        done_paths.add(path_str)
+                        progressed += 1
+                        if _shutdown.is_set():
+                            pool.terminate()
+                            break
+                        f = Path(path_str)
+                        progress.advance(task_extract)
+                        if text.strip():
+                            pending_texts[f] = text
+                        else:
+                            no_text_files.append(f)
+                        if len(pending_texts) >= args.batch:
+                            embed_q.put(dict(pending_texts))
+                            pending_texts = {}
+                except Exception as exc:
+                    console.print(
+                        f"\n  [yellow]⚠ Worker crash ({type(exc).__name__}): {exc}[/]")
+
+            files_todo = [p for p in files_todo if p not in done_paths]
+
+            if files_todo and not _shutdown.is_set():
+                if progressed == 0:
+                    console.print(
+                        f"  [red]⚠ No progress — giving up on "
+                        f"{len(files_todo):,} remaining files[/]")
+                    for p in files_todo:
+                        no_text_files.append(Path(p))
+                    break
+                for p in files_todo:
+                    fail_counts[p] += 1
+                bad = [p for p in files_todo if fail_counts[p] >= MAX_FAILS]
+                if bad:
+                    for p in bad:
+                        no_text_files.append(Path(p))
+                        done_paths.add(p)
+                    files_todo = [p for p in files_todo if fail_counts[p] < MAX_FAILS]
+                    console.print(
+                        f"  [yellow]Gave up on {len(bad):,} repeatedly-crashing files[/]")
+                if files_todo:
+                    console.print(
+                        f"  [dim]Restarting pool: {len(files_todo):,} files remain[/]")
 
         # Final partial batch + sentinel to shut down embed thread
         if pending_texts:
