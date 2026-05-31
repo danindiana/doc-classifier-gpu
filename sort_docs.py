@@ -281,6 +281,71 @@ def _collect_results(out_qs, all_results, progress, task_embed):
                 pass
 
 
+# ── Extraction side-channel (keeps large text OFF the Pool result pipe) ─────────
+#
+# WHY: pool.imap_unordered() carries the worker's return value back through the
+# Pool's result pipe. When that return value is the full extracted text (often
+# 300 KB+), a sibling worker crashing on a malformed PDF can corrupt the pipe's
+# pickle framing — Pool's internal _handle_results daemon thread then dies with
+# UnicodeDecodeError, result delivery stops, and the whole run hangs. That thread
+# is NOT reachable by our restart-loop try/except (which only wraps the main-thread
+# iterator).  Fix: workers push (path, text) onto a Manager queue (socket-backed,
+# server-mediated — a crashing worker cannot desync other workers' streams) and
+# return only the tiny path_str through the Pool pipe (≤ PIPE_BUF, atomic, safe).
+
+_WORKER_EXTRACT_Q = None
+
+
+def _worker_init(extract_q):
+    """Pool initializer: stash the Manager extract queue as a worker-global."""
+    global _WORKER_EXTRACT_Q
+    _WORKER_EXTRACT_Q = extract_q
+
+
+def _extract_via_sidechannel(path_str):
+    """Pool worker: extract text, push (path, text) to the Manager queue,
+    return only path_str through the Pool pipe."""
+    try:
+        text = extract_text(Path(path_str), ocr_reader=None)
+    except Exception:
+        text = ""
+    try:
+        _WORKER_EXTRACT_Q.put((path_str, text))
+    except Exception:
+        pass
+    return path_str
+
+
+def _drain_extract_q(extract_q, in_qs, batch_size, no_text_files,
+                     progress, task_extract):
+    """Thread: read (path, text) off the Manager extract queue, dedup, batch,
+    and dispatch batches round-robin to the embed input queue(s). Exits on the
+    None sentinel, flushing any final partial batch first."""
+    pending = {}
+    seen = set()
+    batch_idx = 0
+    while True:
+        item = extract_q.get()
+        if item is None:
+            break
+        path_str, text = item
+        if path_str in seen:          # retried file — already counted
+            continue
+        seen.add(path_str)
+        progress.advance(task_extract)
+        f = Path(path_str)
+        if text and text.strip():
+            pending[f] = text
+        else:
+            no_text_files.append(f)
+        if len(pending) >= batch_size:
+            in_qs[batch_idx % len(in_qs)].put(dict(pending))
+            pending = {}
+            batch_idx += 1
+    if pending:                       # final partial batch
+        in_qs[batch_idx % len(in_qs)].put(dict(pending))
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -384,13 +449,19 @@ def main():
     # Background thread dequeues batches and embeds them on GPU simultaneously.
     all_results   = []
     no_text_files = []
-    pending_texts = {}
     t0_total = time.time()
 
     gpu_mode = "dual-GPU (subprocess)" if not args.single_gpu else "single-GPU (thread)"
     console.print(
         f"[bold]Streaming {len(all_files):,} files "
         f"({args.workers} workers · embed every {args.batch} · {gpu_mode})[/]\n")
+
+    # One Manager for BOTH modes. It backs the extraction side-channel (extract_q)
+    # and, in dual-GPU mode, the embed input/output queues. Manager queues are
+    # socket-backed and fork-safe — see the side-channel rationale above and
+    # CORRECTNESS §4a.
+    manager   = mp.Manager()
+    extract_q = manager.Queue()
 
     with _make_progress() as progress:
         task_extract = progress.add_task(
@@ -415,18 +486,9 @@ def main():
             collector = embed_thread
         else:
             # Spawn two isolated embed processes — each loads its own encoder.
-            # 'spawn' start method gives each subprocess a fresh Python heap,
-            # avoiding the glibc corruption that occurs with two SentenceTransformer
-            # instances in one process.
-            #
-            # IMPORTANT: use mp.Manager().Queue() NOT ctx.Queue().
-            # ctx.Queue() starts feeder threads in the main process; when Pool()
-            # later forks the extraction workers, they inherit locked mutexes from
-            # those threads → silent deadlock (all workers stuck on futex_).
-            # Manager queues use a server process + sockets — no shared locks,
-            # fully fork-safe.
+            # 'spawn' gives each subprocess a fresh Python heap, avoiding the glibc
+            # corruption from two SentenceTransformer instances in one process.
             ctx     = mp.get_context('spawn')
-            manager = mp.Manager()
             in_qs   = [manager.Queue(), manager.Queue()]
             out_qs  = [manager.Queue(), manager.Queue()]
             procs  = []
@@ -449,36 +511,40 @@ def main():
             )
             collector.start()
 
-        # Restart loop: if a worker crashes (WorkerLostError propagates through
-        # imap_unordered), pool.terminate() is called on __exit__ and other workers
-        # get BrokenPipeError.  We restart a fresh pool for the remaining files.
+        # Drain thread: reads (path, text) off the Manager extract_q, batches, and
+        # dispatches to the embed input queue(s). Keeps the large text payloads off
+        # the Pool result pipe.
+        drain_thread = threading.Thread(
+            target=_drain_extract_q,
+            args=(extract_q, in_qs, args.batch, no_text_files,
+                  progress, task_extract),
+            daemon=True,
+        )
+        drain_thread.start()
+
+        # Restart loop: workers push (path,text) to extract_q and return only
+        # path_str through the Pool pipe. If a worker crashes, imap_unordered may
+        # raise in the main thread (caught here) or the Pool may break; either way
+        # we restart a fresh pool for the files not yet in done_paths.
         files_todo  = [str(f) for f in all_files]
         done_paths  = set()
         fail_counts = Counter()
         MAX_FAILS   = 2
-        batch_idx   = 0   # round-robins across in_qs for dual-GPU load balancing
 
         while files_todo and not _shutdown.is_set():
             progressed = 0
-            with Pool(processes=args.workers, maxtasksperchild=args.maxtasks) as pool:
+            with Pool(processes=args.workers, maxtasksperchild=args.maxtasks,
+                      initializer=_worker_init, initargs=(extract_q,)) as pool:
                 try:
-                    for path_str, text in pool.imap_unordered(
-                            _extract_cpu, files_todo, chunksize=1):
+                    for path_str in pool.imap_unordered(
+                            _extract_via_sidechannel, files_todo, chunksize=1):
+                        # Only the tiny path_str crosses the Pool pipe; the text was
+                        # pushed to extract_q and is handled by the drain thread.
                         done_paths.add(path_str)
                         progressed += 1
                         if _shutdown.is_set():
                             pool.terminate()
                             break
-                        f = Path(path_str)
-                        progress.advance(task_extract)
-                        if text.strip():
-                            pending_texts[f] = text
-                        else:
-                            no_text_files.append(f)
-                        if len(pending_texts) >= args.batch:
-                            in_qs[batch_idx % len(in_qs)].put(dict(pending_texts))
-                            pending_texts = {}
-                            batch_idx += 1
                 except Exception as exc:
                     console.print(
                         f"\n  [yellow]⚠ Worker crash ({type(exc).__name__}): {exc}[/]")
@@ -492,6 +558,7 @@ def main():
                         f"{len(files_todo):,} remaining files[/]")
                     for p in files_todo:
                         no_text_files.append(Path(p))
+                        progress.advance(task_extract)
                     break
                 for p in files_todo:
                     fail_counts[p] += 1
@@ -500,6 +567,7 @@ def main():
                     for p in bad:
                         no_text_files.append(Path(p))
                         done_paths.add(p)
+                        progress.advance(task_extract)
                     files_todo = [p for p in files_todo if fail_counts[p] < MAX_FAILS]
                     console.print(
                         f"  [yellow]Gave up on {len(bad):,} repeatedly-crashing files[/]")
@@ -507,9 +575,10 @@ def main():
                     console.print(
                         f"  [dim]Restarting pool: {len(files_todo):,} files remain[/]")
 
-        # Final partial batch
-        if pending_texts:
-            in_qs[batch_idx % len(in_qs)].put(dict(pending_texts))
+        # All files attempted. Stop the drain thread (it flushes the final partial
+        # batch), then signal the embed stage, then wait for results.
+        extract_q.put(None)
+        drain_thread.join()
 
         # Shutdown embed thread / subprocess(es) and collector
         if args.single_gpu:
@@ -523,7 +592,8 @@ def main():
                 if p.is_alive():
                     p.terminate()
             collector.join()         # wait for all results to be merged
-            manager.shutdown()       # tear down the manager server process
+
+        manager.shutdown()           # tear down the Manager server (both modes)
 
     elapsed = time.time() - t0_total
     total_extracted = len(all_results)
