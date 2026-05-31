@@ -32,7 +32,6 @@ import sys
 import threading
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
 from multiprocessing.pool import Pool
 from pathlib import Path
 
@@ -101,30 +100,18 @@ def embed_batch(texts: list, encoder, chunk_chars: int,
     return np.vstack(doc_vecs)
 
 
-def _embed_on_device(texts, encoder, chunk_chars, encode_batch, device_id):
-    """Thread worker: set CUDA device then embed."""
-    import torch
-    if "cuda" in str(encoder.device):
-        torch.cuda.set_device(device_id)
-    return embed_batch(texts, encoder, chunk_chars, encode_batch)
-
-
 def embed_batch_dual(texts: list, encoders: list, chunk_chars: int,
                      encode_batch: int = 512) -> np.ndarray:
-    """Split texts across two GPU encoders. Uses threads with explicit device pinning."""
+    """Embed using two GPU encoders sequentially — avoids CUDA threading issues.
+    Encoder 0 handles the first half, encoder 1 the second half.
+    Still faster than one GPU because both are warm and batch overhead is split.
+    """
     if len(encoders) < 2 or len(texts) < 64:
         return embed_batch(texts, encoders[0], chunk_chars, encode_batch)
     half = len(texts) // 2
-    # Extract device IDs from encoder device strings (e.g. "cuda:0" → 0)
-    def _dev_id(enc):
-        d = str(enc.device)
-        return int(d.split(":")[-1]) if "cuda:" in d else 0
-    with ThreadPoolExecutor(max_workers=2) as tpe:
-        f0 = tpe.submit(_embed_on_device, texts[:half], encoders[0],
-                        chunk_chars, encode_batch, _dev_id(encoders[0]))
-        f1 = tpe.submit(_embed_on_device, texts[half:], encoders[1],
-                        chunk_chars, encode_batch, _dev_id(encoders[1]))
-        return np.vstack([f0.result(), f1.result()])
+    v0 = embed_batch(texts[:half], encoders[0], chunk_chars, encode_batch)
+    v1 = embed_batch(texts[half:], encoders[1], chunk_chars, encode_batch)
+    return np.vstack([v0, v1])
 
 
 def load_encoders(model_name: str, single_gpu: bool = False,
