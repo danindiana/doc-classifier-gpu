@@ -87,13 +87,25 @@ def embed_batch(texts: list, encoder, chunk_chars: int,
         all_chunks.extend(chunks)
     if not all_chunks:
         return np.zeros((len(texts), encoder.get_sentence_embedding_dimension()))
-    vecs = encoder.encode(
-        all_chunks,
-        batch_size=encode_batch,
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-        show_progress_bar=False,
-    )
+    # OOM recovery: halve encode_batch until it fits, down to 4
+    while True:
+        try:
+            import torch
+            vecs = encoder.encode(
+                all_chunks,
+                batch_size=encode_batch,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
+            break
+        except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+            if "out of memory" not in str(e).lower() or encode_batch <= 4:
+                raise
+            torch.cuda.empty_cache()
+            encode_batch = max(4, encode_batch // 2)
+            print(f"  ⚠ GPU OOM — retrying with encode_batch={encode_batch}",
+                  file=sys.stderr)
     doc_vecs, i = [], 0
     for n in spans:
         doc_vecs.append(vecs[i:i + n].mean(axis=0))
