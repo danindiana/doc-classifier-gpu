@@ -42,7 +42,7 @@ A fitted `sklearn.linear_model.LogisticRegression`. Its weight matrix has shape
 
 1. The query document is embedded to a 1024-dim unit vector (see below)
 2. A dot product against each class weight vector gives a raw score per class
-3. Softmax converts those scores to a probability distribution over all 69 classes
+3. Softmax converts those scores to a probability distribution over all 64 classes
 4. The top-N classes and their probabilities are returned
 
 LogisticRegression is well-calibrated — the output percentages approximate real-world
@@ -96,7 +96,7 @@ bge-m3.encode(chunks, batch_size=32, normalize_embeddings=True)
 mean over chunks → shape (1024,)              ← document vector
    │
    ▼
-LogisticRegression.predict_proba([doc_vec])   ← softmax over 69 classes
+LogisticRegression.predict_proba([doc_vec])   ← softmax over 64 classes
    → [(class_name, probability), ...]
 ```
 
@@ -106,7 +106,7 @@ cluster together regardless of vocabulary.
 
 ---
 
-## The 69 classes
+## The 64 classes
 
 One class per training sub-folder. The full list from the training corpus:
 

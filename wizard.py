@@ -319,7 +319,7 @@ def launch_training(cfg: dict) -> bool:
     console.print("  Command:\n")
     console.print(Panel(f"[green]{cmd}[/]", border_style="green", padding=(0, 2)))
     console.print()
-    info("Training opens in a new xterm window for full visibility.")
+    info("Training opens in an alacritty window (mouse-select to copy errors).")
     info("• Rich TUI shows per-class progress bars + GPU stats after each class")
     info("• GPU selected automatically — whichever has the most free VRAM")
     info("• bge-m3 downloads ~2.2 GB on first run (one-time)")
@@ -329,15 +329,14 @@ def launch_training(cfg: dict) -> bool:
         console.print("  [dim]Cancelled.[/]")
         return False
 
-    xterm_cmd = (
-        f'DISPLAY=:0 xterm -title "doc_classifier_gpu — training" '
-        f'-fa "Monospace" -fs 11 -geometry 130x55 '
+    alacritty_cmd = (
+        f'DISPLAY=:0 alacritty --title "doc_classifier_gpu — training" '
         f'-e bash -c \'source {VENV_DIR}/bin/activate; {cmd}; '
         f'echo; echo "--- done (exit $?) --- press Enter to close ---"; read\' &'
     )
-    os.system(xterm_cmd)
+    os.system(alacritty_cmd)
     console.print()
-    ok("Training xterm launched.")
+    ok("Training launched in alacritty.")
     console.print("  [dim]Press Enter here when training completes ...[/]")
     input()
     return True
@@ -349,7 +348,7 @@ def inspect_model(model_path: Path):
     section("Model Inspection")
     if not model_path.exists():
         err(f"Not found: [cyan]{model_path}[/]")
-        info("Training may still be running, or check the xterm for errors.")
+        info("Training may still be running — check the alacritty window for errors.")
         return
 
     size_kb = model_path.stat().st_size // 1024

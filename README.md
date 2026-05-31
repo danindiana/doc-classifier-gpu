@@ -30,10 +30,10 @@ python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_
 pip install sentence-transformers easyocr pymupdf scikit-learn joblib pdfplumber python-docx striprtf
 
 # 4. Train (sub-folders of training_root become class labels)
-CUDA_VISIBLE_DEVICES=0 python doc_classifier_gpu.py train /path/to/training_root -m model.joblib
+python doc_classifier_gpu.py train /path/to/training_root -m model.joblib
 
 # 5. Classify
-CUDA_VISIBLE_DEVICES=0 python doc_classifier_gpu.py predict /path/to/new_doc.pdf -m model.joblib
+python doc_classifier_gpu.py predict /path/to/new_doc.pdf -m model.joblib
 ```
 
 ---
