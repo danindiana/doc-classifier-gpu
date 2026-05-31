@@ -25,6 +25,7 @@ Output:
 
 import argparse
 import csv
+import multiprocessing as mp
 import os
 import queue
 import shutil
@@ -205,6 +206,81 @@ def _flush_batch(texts_map: dict, encoders: list, clf, classes,
     console.print(f"  [green]embedded {len(files_b):,}[/]  {_gpu_stat()}")
 
 
+# ── Dual-GPU subprocess workers ────────────────────────────────────────────────
+
+def _embed_proc_fn(in_q, out_q, embed_model, clf_path, chunk_chars,
+                   encode_batch, threshold, device):
+    """Subprocess worker: loads its own encoder+clf in an isolated heap.
+    Heap isolation prevents the glibc corruption that occurs when two
+    SentenceTransformer instances are loaded in the same process.
+    Receives {Path: text} dicts, emits [(Path,cls,conf,sec_cls,sec_conf)] lists.
+    """
+    from sentence_transformers import SentenceTransformer
+
+    try:
+        encoder = SentenceTransformer(embed_model, device=device,
+                                      trust_remote_code=True)
+    except Exception as e:
+        print(f"  ⚠ [{device}] encoder load failed: {e}", file=sys.stderr, flush=True)
+        out_q.put(None)
+        return
+
+    try:
+        bundle  = joblib.load(clf_path)
+        clf     = bundle["clf"]
+        classes = clf.classes_
+    except Exception as e:
+        print(f"  ⚠ [{device}] clf load failed: {e}", file=sys.stderr, flush=True)
+        out_q.put(None)
+        return
+
+    print(f"  ✓ [{device}] embed subprocess ready", file=sys.stderr, flush=True)
+
+    while True:
+        batch = in_q.get()
+        if batch is None:
+            break
+        try:
+            files_b  = list(batch.keys())
+            texts_b  = list(batch.values())
+            vecs     = embed_batch(texts_b, encoder, chunk_chars, encode_batch)
+            probas   = clf.predict_proba(vecs)
+            rows = []
+            for f, proba in zip(files_b, probas):
+                order     = proba.argsort()[::-1]
+                best_conf = float(proba[order[0]])
+                cls       = classes[order[0]] if best_conf >= threshold else "_review"
+                sec_cls   = classes[order[1]] if len(order) > 1 else ""
+                sec_conf  = float(proba[order[1]]) if len(order) > 1 else 0.0
+                rows.append((f, cls, best_conf, sec_cls, sec_conf))
+            out_q.put(rows)
+        except Exception as e:
+            print(f"  ⚠ [{device}] batch error: {e}", file=sys.stderr, flush=True)
+            out_q.put([])
+
+    out_q.put(None)   # sentinel: subprocess finished
+
+
+def _collect_results(out_qs, all_results, progress, task_embed):
+    """Thread: drain result rows from embed subprocess output queues."""
+    done = [False] * len(out_qs)
+    while not all(done):
+        for i, q in enumerate(out_qs):
+            if done[i]:
+                continue
+            try:
+                rows = q.get(timeout=0.05)
+                if rows is None:
+                    done[i] = True
+                elif rows:
+                    all_results.extend(rows)
+                    progress.advance(task_embed, advance=len(rows))
+            except queue.Empty:
+                pass
+            except Exception:
+                pass
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -271,13 +347,30 @@ def main():
     chunk_chars = bundle.get("chunk_chars", args.chunk_chars)
     classes     = clf.classes_
 
-    console.print(f"\n[bold cyan]▶ Loading encoder(s)[/] — dual GPU: {not args.single_gpu} ...")
-    encoders = load_encoders(embed_model, single_gpu=args.single_gpu)
+    # Check GPU count before deciding mode (torch.cuda.device_count doesn't
+    # block spawn-based subprocesses since they get a fresh Python interpreter)
+    import torch as _torch
+    _n_gpus = _torch.cuda.device_count()
+    if not args.single_gpu and _n_gpus < 2:
+        console.print(f"[yellow]⚠ Only {_n_gpus} GPU(s) detected — single-GPU mode[/]")
+        args.single_gpu = True
 
-    device     = str(encoders[0].device)
-    ocr_reader = None if args.skip_ocr else get_ocr_reader(device)
-    if args.skip_ocr:
-        console.print("  [dim]--skip-ocr: GPU OCR disabled — image-only files → _review/[/]")
+    if not args.single_gpu:
+        console.print(
+            "[bold cyan]▶ Dual-GPU subprocess mode[/] "
+            "(cuda:0 + cuda:1, isolated heaps) ...")
+        if not args.skip_ocr:
+            console.print("  [yellow]⚠ OCR not supported in dual-GPU mode — "
+                          "image-only files → _review/[/]")
+        encoders   = []   # not used by main process in this mode
+        ocr_reader = None
+    else:
+        console.print(f"\n[bold cyan]▶ Loading encoder[/] (single GPU) ...")
+        encoders = load_encoders(embed_model, single_gpu=True)
+        device   = str(encoders[0].device)
+        ocr_reader = None if args.skip_ocr else get_ocr_reader(device)
+        if args.skip_ocr:
+            console.print("  [dim]--skip-ocr: GPU OCR disabled — image-only files → _review/[/]")
 
     console.print("\n[bold]Scanning source directory ...[/]")
     all_files = sorted(
@@ -294,9 +387,10 @@ def main():
     pending_texts = {}
     t0_total = time.time()
 
+    gpu_mode = "dual-GPU (subprocess)" if not args.single_gpu else "single-GPU (thread)"
     console.print(
         f"[bold]Streaming {len(all_files):,} files "
-        f"({args.workers} workers · embed every {args.batch} · background thread)[/]\n")
+        f"({args.workers} workers · embed every {args.batch} · {gpu_mode})[/]\n")
 
     with _make_progress() as progress:
         task_extract = progress.add_task(
@@ -306,15 +400,46 @@ def main():
             f"[blue]GPU embed[/] (encode-batch={args.encode_batch})",
             total=len(all_files))
 
-        embed_q = queue.Queue()   # unbounded — batches live in RAM until embedded
-        embed_thread = threading.Thread(
-            target=_embedding_worker,
-            args=(embed_q, encoders, clf, classes, chunk_chars,
-                  args.encode_batch, args.threshold, all_results,
-                  progress, task_embed),
-            daemon=True,
-        )
-        embed_thread.start()
+        if args.single_gpu:
+            embed_q = queue.Queue()
+            in_qs   = [embed_q]
+            embed_thread = threading.Thread(
+                target=_embedding_worker,
+                args=(embed_q, encoders, clf, classes, chunk_chars,
+                      args.encode_batch, args.threshold, all_results,
+                      progress, task_embed),
+                daemon=True,
+            )
+            embed_thread.start()
+            procs     = []
+            collector = embed_thread
+        else:
+            # Spawn two isolated embed processes — each loads its own encoder.
+            # 'spawn' start method gives each subprocess a fresh Python heap,
+            # avoiding the glibc corruption that occurs with two SentenceTransformer
+            # instances in one process.
+            ctx    = mp.get_context('spawn')
+            in_qs  = [ctx.Queue(), ctx.Queue()]
+            out_qs = [ctx.Queue(), ctx.Queue()]
+            procs  = []
+            for i in range(2):
+                p = ctx.Process(
+                    target=_embed_proc_fn,
+                    args=(in_qs[i], out_qs[i], embed_model, str(model_p),
+                          chunk_chars, args.encode_batch, args.threshold,
+                          f"cuda:{i}"),
+                    daemon=True,
+                    name=f"embed-gpu{i}",
+                )
+                p.start()
+                procs.append(p)
+            console.print("  [dim]embed subprocesses spawned (cuda:0, cuda:1)[/]")
+            collector = threading.Thread(
+                target=_collect_results,
+                args=(out_qs, all_results, progress, task_embed),
+                daemon=True,
+            )
+            collector.start()
 
         # Restart loop: if a worker crashes (WorkerLostError propagates through
         # imap_unordered), pool.terminate() is called on __exit__ and other workers
@@ -323,6 +448,7 @@ def main():
         done_paths  = set()
         fail_counts = Counter()
         MAX_FAILS   = 2
+        batch_idx   = 0   # round-robins across in_qs for dual-GPU load balancing
 
         while files_todo and not _shutdown.is_set():
             progressed = 0
@@ -342,8 +468,9 @@ def main():
                         else:
                             no_text_files.append(f)
                         if len(pending_texts) >= args.batch:
-                            embed_q.put(dict(pending_texts))
+                            in_qs[batch_idx % len(in_qs)].put(dict(pending_texts))
                             pending_texts = {}
+                            batch_idx += 1
                 except Exception as exc:
                     console.print(
                         f"\n  [yellow]⚠ Worker crash ({type(exc).__name__}): {exc}[/]")
@@ -372,11 +499,22 @@ def main():
                     console.print(
                         f"  [dim]Restarting pool: {len(files_todo):,} files remain[/]")
 
-        # Final partial batch + sentinel to shut down embed thread
+        # Final partial batch
         if pending_texts:
-            embed_q.put(dict(pending_texts))
-        embed_q.put(None)
-        embed_thread.join()   # wait for all GPU embedding to complete
+            in_qs[batch_idx % len(in_qs)].put(dict(pending_texts))
+
+        # Shutdown embed thread / subprocess(es) and collector
+        if args.single_gpu:
+            in_qs[0].put(None)
+            collector.join()
+        else:
+            for q in in_qs:
+                q.put(None)          # sentinel to each embed subprocess
+            for p in procs:
+                p.join(timeout=300)
+                if p.is_alive():
+                    p.terminate()
+            collector.join()         # wait for all results to be merged
 
     elapsed = time.time() - t0_total
     total_extracted = len(all_results)
