@@ -213,8 +213,8 @@ def main():
     parser.add_argument("--threshold", type=float, default=0.40,
                         help="Confidence below this → _review/ (default 0.40)")
     parser.add_argument("--workers", type=int,
-                        default=min(24, max(1, (os.cpu_count() or 4) - 2)),
-                        help="Parallel CPU extraction processes (default: cpu_count-2, max 24)")
+                        default=min(12, max(1, (os.cpu_count() or 4) - 2)),
+                        help="Parallel CPU extraction processes (default: min(12, cpu_count-2))")
     parser.add_argument("--maxtasks", type=int, default=20,
                         help="Pool maxtasksperchild — 20 cuts fork overhead, 1=max isolation")
     parser.add_argument("--batch", type=int, default=512,
