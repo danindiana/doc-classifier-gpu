@@ -163,8 +163,6 @@ progress bar is advancing, the job is running — ignore the MuPDF noise.
 
 ---
 
----
-
 ## 11. `imap_unordered` + worker crash = BrokenPipeError cascade
 
 **What happened:** `sort_docs.py` used `pool.imap_unordered()`. When one worker crashed
@@ -204,6 +202,69 @@ survivable. Use a restart loop with done-set tracking, or use `apply_async` with
 
 ---
 
+---
+
+## 12. xterm has no clipboard copy — use alacritty for operator-visible jobs
+
+**What happened:** sort_docs.py was launched in xterm. When errors appeared, the
+operator couldn't copy the traceback — xterm uses X11 primary selection
+(mouse-highlight → middle-click paste only), not the desktop clipboard. Errors had
+to be re-typed by hand.
+
+**Fix:** Relaunch in alacritty (`/usr/local/bin/alacritty`). Mouse-select any text
+→ auto-copied to clipboard. Ctrl+Shift+C also works. Paste with Ctrl+Shift+V or
+middle-click. Other copyable alternatives: xfce4-terminal, gnome-terminal, kitty.
+
+**Rule:** Any job where the operator might need to copy error output belongs in
+alacritty or another modern terminal. Reserve xterm for headless/scriptable use
+where no human needs to read or copy the output.
+
+**Launch pattern:**
+```bash
+DISPLAY=:0 alacritty --title "job name" -e bash -c '
+  source ~/venv/bin/activate
+  python my_script.py ...
+  echo "--- done --- press Enter ---"; read
+' &
+```
+
+---
+
+## 13. bge-m3 on RTX 5080: model uses ~14 GB, encode-batch=512 OOM
+
+**What happened:** bge-m3 loaded onto RTX 5080 (16 GB total). Model weights +
+overhead consumed ~14.7 GB, leaving ~1.24 GB free. The embed background thread
+attempted `encoder.encode(batch_size=512)` on 512 text chunks → needed 2.94 GB
+for activations → `torch.OutOfMemoryError`. The embed thread crashed silently;
+extraction kept running but results queued with no consumer.
+
+**Root cause:** encode-batch=512 means 512 chunks × ~1000 tokens each go through
+the transformer in one forward pass. XLM-Roberta attention scales with
+batch×seq_len. With only 1.24 GB headroom, any batch >~100 chunks OOMs.
+
+**Fix:**
+1. Relaunch with `--encode-batch 32` (fits in ~1.2 GB; 32 chunks × 1000 tokens).
+2. Added OOM recovery loop in `embed_batch()` (`sort_docs.py`): on
+   `OutOfMemoryError`, halves `encode_batch` (min 4), calls `torch.cuda.empty_cache()`,
+   and retries. Self-heals without crashing the embed thread.
+
+**Rule:** For bge-m3 on a 16 GB GPU, default `--encode-batch` to 32. Add the OOM
+recovery loop as standard boilerplate in any `encoder.encode()` call site.
+
+```python
+while True:
+    try:
+        vecs = encoder.encode(chunks, batch_size=encode_batch, ...)
+        break
+    except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+        if "out of memory" not in str(e).lower() or encode_batch <= 4:
+            raise
+        torch.cuda.empty_cache()
+        encode_batch = max(4, encode_batch // 2)
+```
+
+---
+
 ## Summary table
 
 | # | Lesson | Fix |
@@ -214,8 +275,10 @@ survivable. Use a restart loop with done-set tracking, or use `apply_async` with
 | 4 | `console.print(stderr=True)` is not valid rich | `print(..., file=sys.stderr)` |
 | 5 | macOS `._` files crash OCR | Filter `f.name.startswith("._")` |
 | 6 | OOM at model load when GPU is busy | `_pick_device()` — probe before loading |
-| 7 | Background training hides errors | Always use xterm |
+| 7 | Background training hides errors | Use alacritty / xterm (visible terminal) |
 | 8 | Assumed one GPU at a time | Auto device selection, both GPUs simultaneously |
 | 9 | Full OCR on bulk corpus = 91 hours | `--skip-ocr` or `--max-ocr-pages 3` |
 | 10 | MuPDF stderr output looks like failures | Informational only — check progress bar |
 | 11 | `imap_unordered` + worker crash = BrokenPipeError cascade | Restart loop with `done_paths` tracking |
+| 12 | xterm has no clipboard copy for operator error capture | Use alacritty (mouse-select → clipboard) |
+| 13 | bge-m3 encode-batch=512 OOM on 16 GB GPU | `--encode-batch 32` + OOM recovery loop |
