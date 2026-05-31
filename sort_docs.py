@@ -160,44 +160,24 @@ def safe_dest(dst_dir: Path, src: Path) -> Path:
     raise RuntimeError(f"Cannot find free name for {src.name} in {dst_dir}")
 
 
-def extract_window(files: list, workers: int, maxtasks: int,
-                   ocr_reader, skip_ocr: bool, max_ocr_pages: int,
-                   progress, task):
-    """Extract text from a window of files. Returns (texts_map, no_text_files)."""
-    texts_map = {}
-    needs_ocr = []
-    needs_seq = []
-
-    with Pool(processes=workers, maxtasksperchild=maxtasks) as pool:
-        try:
-            for path_str, text in pool.imap_unordered(
-                    _extract_cpu, [str(f) for f in files], chunksize=1):
-                f = Path(path_str)
-                if text.strip():
-                    texts_map[f] = text
-                else:
-                    needs_ocr.append(f)
-                progress.advance(task)
-        except Exception:
-            # Worker crashed mid-batch — fall back remaining files to sequential
-            done = set(texts_map) | set(needs_ocr)
-            needs_seq.extend(f for f in files if f not in done)
-
-    for f in needs_seq:
-        text = extract_text(f, ocr_reader=None)
-        if text.strip():
-            texts_map[f] = text
-        else:
-            needs_ocr.append(f)
-
-    if not skip_ocr and ocr_reader is not None:
-        for f in sorted(needs_ocr):
-            text = extract_text(f, ocr_reader, max_ocr_pages=max_ocr_pages)
-            if text.strip():
-                texts_map[f] = text
-
-    no_text = [f for f in files if f not in texts_map]
-    return texts_map, no_text
+def _flush_batch(texts_map: dict, encoders: list, clf, classes,
+                 chunk_chars: int, encode_batch: int, threshold: float,
+                 all_results: list, progress, task_emb):
+    """Embed + predict one batch of extracted texts; append to all_results."""
+    files_b = list(texts_map.keys())
+    texts_b = list(texts_map.values())
+    vecs    = embed_batch_dual(texts_b, encoders, chunk_chars, encode_batch)
+    probas  = clf.predict_proba(vecs)
+    for f, proba in zip(files_b, probas):
+        order     = proba.argsort()[::-1]
+        best_cls  = classes[order[0]]
+        best_conf = float(proba[order[0]])
+        sec_cls   = classes[order[1]] if len(order) > 1 else ""
+        sec_conf  = float(proba[order[1]]) if len(order) > 1 else 0.0
+        cls = best_cls if best_conf >= threshold else "_review"
+        all_results.append((f, cls, best_conf, sec_cls, sec_conf))
+    progress.advance(task_emb, advance=len(files_b))
+    console.print(f"  [green]embedded {len(files_b):,}[/]  {_gpu_stat()}")
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -280,14 +260,17 @@ def main():
     )
     console.print(f"  Found [green]{len(all_files):,}[/] files\n")
 
-    # ── Streaming pipeline: extract window → embed window → next window ────────
-    all_results  = []   # (Path, proba_array)
+    # ── Persistent Pool + streaming embed: workers run continuously ───────────
+    # One pool for all files; embed every --batch extracted texts immediately.
+    # CPU workers and GPU encoder both active simultaneously — no idle gaps.
+    all_results   = []
     no_text_files = []
+    pending_texts = {}   # Path → text, accumulating toward next embed batch
     t0_total = time.time()
 
-    n_windows = (len(all_files) + args.batch - 1) // args.batch
-    console.print(f"[bold]Processing {n_windows} windows "
-                  f"({args.batch} files each) ...[/]\n")
+    console.print(
+        f"[bold]Streaming {len(all_files):,} files "
+        f"({args.workers} workers · embed every {args.batch}) ...[/]\n")
 
     with _make_progress() as progress:
         task_extract = progress.add_task(
@@ -295,41 +278,39 @@ def main():
             total=len(all_files))
         task_embed = progress.add_task(
             f"[blue]GPU embed[/] (encode-batch={args.encode_batch})",
-            total=n_windows)
+            total=len(all_files))
 
-        for w in range(n_windows):
-            if _shutdown.is_set():
-                console.print(
-                    f"  [yellow]Stopping at window {w+1}/{n_windows} — "
-                    f"{len(all_results):,} docs classified so far[/]")
-                break
+        with Pool(processes=args.workers, maxtasksperchild=args.maxtasks) as pool:
+            try:
+                result_iter = pool.imap_unordered(
+                    _extract_cpu, [str(f) for f in all_files], chunksize=1)
+                for path_str, text in result_iter:
+                    if _shutdown.is_set():
+                        pool.terminate()
+                        break
+                    f = Path(path_str)
+                    progress.advance(task_extract)
+                    if text.strip():
+                        pending_texts[f] = text
+                    else:
+                        no_text_files.append(f)
 
-            window = all_files[w * args.batch:(w + 1) * args.batch]
+                    # GPU embeds whenever a full batch is ready
+                    # Workers keep running during this call — true overlap
+                    if len(pending_texts) >= args.batch:
+                        _flush_batch(pending_texts, encoders, clf, classes,
+                                     chunk_chars, args.encode_batch,
+                                     args.threshold, all_results,
+                                     progress, task_embed)
+                        pending_texts = {}
+            except Exception as exc:
+                console.print(f"  [yellow]⚠ Pool error: {exc}[/]")
 
-            # Extract this window
-            texts_map, no_text = extract_window(
-                window, args.workers, args.maxtasks,
-                ocr_reader, args.skip_ocr, args.max_ocr_pages,
-                progress, task_extract,
-            )
-            no_text_files.extend(no_text)
-
-            # Embed + predict immediately (GPU active, CPU free for next window)
-            if texts_map:
-                files_w = list(texts_map.keys())
-                texts_w = [texts_map[f] for f in files_w]
-                vecs = embed_batch_dual(texts_w, encoders, chunk_chars,
-                                        args.encode_batch)
-                probas = clf.predict_proba(vecs)
-                for f, proba in zip(files_w, probas):
-                    all_results.append((f, proba))
-
-            gpu_str = _gpu_stat()
-            console.print(
-                f"  window {w+1}/{n_windows}  "
-                f"extracted [green]{len(texts_map)}[/]  "
-                f"no-text [dim]{len(no_text)}[/]  {gpu_str}")
-            progress.advance(task_embed)
+        # Final partial batch (remaining texts after last full flush)
+        if pending_texts:
+            _flush_batch(pending_texts, encoders, clf, classes,
+                         chunk_chars, args.encode_batch,
+                         args.threshold, all_results, progress, task_embed)
 
     elapsed = time.time() - t0_total
     total_extracted = len(all_results)
@@ -346,18 +327,8 @@ def main():
         f"({total_extracted / max(elapsed, 1):.0f} docs/s)\n")
 
     # ── Build results list ─────────────────────────────────────────────────────
-    results = []
-    for f in no_text_files:
-        results.append((f, "_review", 0.0, "", 0.0))
-
-    for f, proba in all_results:
-        order    = proba.argsort()[::-1]
-        best_cls  = classes[order[0]]
-        best_conf = float(proba[order[0]])
-        sec_cls   = classes[order[1]] if len(order) > 1 else ""
-        sec_conf  = float(proba[order[1]]) if len(order) > 1 else 0.0
-        cls = best_cls if best_conf >= args.threshold else "_review"
-        results.append((f, cls, best_conf, sec_cls, sec_conf))
+    results = [(f, "_review", 0.0, "", 0.0) for f in no_text_files]
+    results.extend(all_results)  # _flush_batch already appended full tuples
 
     # ── Sort files ─────────────────────────────────────────────────────────────
     if args.mode != "report":
