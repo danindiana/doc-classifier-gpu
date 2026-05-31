@@ -244,7 +244,8 @@ def get_ocr_reader(device: str):
         raise
 
 
-def embed_documents(texts, encoder, chunk_chars: int) -> np.ndarray:
+def embed_documents(texts, encoder, chunk_chars: int,
+                    encode_batch: int = 512) -> np.ndarray:
     """Embed each document as the mean of its chunk embeddings."""
     all_chunks, spans = [], []
     for t in texts:
@@ -254,7 +255,7 @@ def embed_documents(texts, encoder, chunk_chars: int) -> np.ndarray:
 
     chunk_vecs = encoder.encode(
         all_chunks,
-        batch_size=32,
+        batch_size=encode_batch,
         convert_to_numpy=True,
         normalize_embeddings=True,
         show_progress_bar=True,
@@ -267,7 +268,8 @@ def embed_documents(texts, encoder, chunk_chars: int) -> np.ndarray:
     return np.vstack(doc_vecs)
 
 
-def _extract_class(label_dir: Path, workers: int, ocr_reader) -> list:
+def _extract_class(label_dir: Path, workers: int, ocr_reader,
+                   maxtasks: int = 20) -> list:
     """Extract all text from one class directory. Returns list of text strings."""
     files = sorted(f for f in label_dir.rglob("*")
                    if f.is_file() and not f.name.startswith("._"))
@@ -287,7 +289,7 @@ def _extract_class(label_dir: Path, workers: int, ocr_reader) -> list:
     with _make_progress() as progress:
         task_cpu = progress.add_task(
             f"[cyan]CPU extract[/] [dim]{ext}[/]", total=len(files))
-        with Pool(processes=workers, maxtasksperchild=1) as pool:
+        with Pool(processes=workers, maxtasksperchild=maxtasks) as pool:
             async_results = [(f, pool.apply_async(_extract_cpu, (str(f),)))
                              for f in files]
             for f, ar in async_results:
@@ -376,7 +378,7 @@ def train(args):
             "[white]overall classes[/]", total=len(class_dirs))
 
         for label_dir in class_dirs:
-            texts = _extract_class(label_dir, args.workers, ocr_reader)
+            texts = _extract_class(label_dir, args.workers, ocr_reader, maxtasks=args.maxtasks)
 
             if not texts:
                 console.print(
@@ -388,7 +390,7 @@ def train(args):
             console.print(
                 f"  [bold cyan]▶ Embedding[/] [cyan]{label_dir.name}[/] "
                 f"([green]{len(texts)}[/] docs) ...")
-            X = embed_documents(texts, encoder, args.chunk_chars)
+            X = embed_documents(texts, encoder, args.chunk_chars, encode_batch=args.encode_batch)
             elapsed = time.time() - t0
 
             all_X.append(X)
@@ -465,7 +467,7 @@ def predict(args):
     console.print(f"\n[bold cyan]▶ Classifying[/] {len(files)} file(s) ...")
 
     cpu_results, needs_ocr, needs_sequential = [], [], []
-    with Pool(processes=args.workers, maxtasksperchild=1) as pool:
+    with Pool(processes=args.workers, maxtasksperchild=args.maxtasks) as pool:
         async_results = [(f, pool.apply_async(_extract_cpu, (str(f),)))
                          for f in files]
         for f, ar in async_results:
@@ -498,7 +500,7 @@ def predict(args):
         return
 
     valid_files, texts = zip(*all_results)
-    X = embed_documents(list(texts), encoder, chunk_chars)
+    X = embed_documents(list(texts), encoder, chunk_chars, encode_batch=getattr(args, "encode_batch", 512))
     probas = clf.predict_proba(X)
     classes = clf.classes_
 
@@ -531,8 +533,16 @@ def main():
     common.add_argument("--chunk-chars", type=int, default=4000)
     common.add_argument(
         "--workers", type=int,
-        default=min(16, max(1, (os.cpu_count() or 4) - 2)),
-        help="parallel CPU extraction processes (default: cpu_count-2, max 16)",
+        default=min(24, max(1, (os.cpu_count() or 4) - 2)),
+        help="parallel CPU extraction processes (default: cpu_count-2, max 24)",
+    )
+    common.add_argument(
+        "--maxtasks", type=int, default=20,
+        help="pool maxtasksperchild — 20 cuts fork overhead, 1=max isolation",
+    )
+    common.add_argument(
+        "--encode-batch", type=int, default=512,
+        help="encoder.encode internal GPU batch size (default 512)",
     )
 
     p_train = sub.add_parser("train", parents=[common],

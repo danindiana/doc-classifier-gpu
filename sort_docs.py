@@ -2,20 +2,24 @@
 """Bulk-classify and sort a document collection using a trained militia.joblib model.
 
 Usage:
-    CUDA_VISIBLE_DEVICES=0 python sort_docs.py SOURCE_DIR \\
+    python sort_docs.py SOURCE_DIR \\
         --model militia.joblib \\
         --output ./sorted_output \\
-        --mode copy        # copy | symlink | report
-        --threshold 0.40   # confidence < threshold → _review/
-        --workers 14       # parallel CPU extraction processes
-        --batch 256        # documents per embedding batch
+        --mode copy            # copy | symlink | report
+        --threshold 0.60       # confidence < threshold → _review/
+        --workers 24           # parallel CPU extraction processes
+        --maxtasks 20          # pool maxtasksperchild (1=max isolation)
+        --batch 512            # documents per streaming window
+        --encode-batch 512     # encoder.encode internal GPU batch size
+        --skip-ocr             # skip GPU OCR (fast; image files → _review/)
+        --single-gpu           # disable dual-GPU embedding
 
 Output:
     sorted_output/
     ├── strategy/          ← predicted class ≥ threshold
     ├── medical/
     ├── ...
-    ├── _review/           ← max confidence < threshold
+    ├── _review/           ← max confidence < threshold or no text
     └── sort_report.csv    ← full results table
 """
 
@@ -26,13 +30,13 @@ import shutil
 import sys
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from multiprocessing.pool import Pool
 from pathlib import Path
 
 import joblib
 import numpy as np
 
-# ── Bootstrap: add script dir to path so we can import from doc_classifier_gpu
 SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
 
@@ -54,8 +58,9 @@ from rich import box
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def embed_batch(texts: list, encoder, chunk_chars: int) -> np.ndarray:
-    """Embed a list of texts, return (N, 1024) array."""
+def embed_batch(texts: list, encoder, chunk_chars: int,
+                encode_batch: int = 512) -> np.ndarray:
+    """Embed a list of texts → (N, dim) array."""
     all_chunks, spans = [], []
     for t in texts:
         chunks = chunk_text(t, chunk_chars)
@@ -65,7 +70,7 @@ def embed_batch(texts: list, encoder, chunk_chars: int) -> np.ndarray:
         return np.zeros((len(texts), encoder.get_sentence_embedding_dimension()))
     vecs = encoder.encode(
         all_chunks,
-        batch_size=32,
+        batch_size=encode_batch,
         convert_to_numpy=True,
         normalize_embeddings=True,
         show_progress_bar=False,
@@ -77,8 +82,53 @@ def embed_batch(texts: list, encoder, chunk_chars: int) -> np.ndarray:
     return np.vstack(doc_vecs)
 
 
+def embed_batch_dual(texts: list, encoders: list, chunk_chars: int,
+                     encode_batch: int = 512) -> np.ndarray:
+    """Split texts across two GPU encoders using threads (GIL released by CUDA)."""
+    if len(encoders) < 2 or len(texts) < 64:
+        return embed_batch(texts, encoders[0], chunk_chars, encode_batch)
+    half = len(texts) // 2
+    with ThreadPoolExecutor(max_workers=2) as tpe:
+        f0 = tpe.submit(embed_batch, texts[:half], encoders[0], chunk_chars, encode_batch)
+        f1 = tpe.submit(embed_batch, texts[half:], encoders[1], chunk_chars, encode_batch)
+        return np.vstack([f0.result(), f1.result()])
+
+
+def load_encoders(model_name: str, single_gpu: bool = False,
+                  min_free_mb: int = 2500) -> list:
+    """Load one encoder per GPU with enough free VRAM. Returns list of encoders."""
+    import torch
+    from sentence_transformers import SentenceTransformer
+    encoders = []
+    for i in range(torch.cuda.device_count()):
+        if single_gpu and encoders:
+            break
+        try:
+            free, _ = torch.cuda.mem_get_info(i)
+            free_mb = free // (1024 * 1024)
+            name = torch.cuda.get_device_name(i)
+            if free_mb >= min_free_mb:
+                console.print(
+                    f"  [dim]GPU {i} ({name}): {free_mb:,} MB free — loading encoder[/]")
+                enc = SentenceTransformer(model_name, device=f"cuda:{i}",
+                                          trust_remote_code=True)
+                encoders.append(enc)
+            else:
+                console.print(
+                    f"  [dim]GPU {i} ({name}): {free_mb:,} MB free — skip[/]")
+        except Exception as e:
+            console.print(f"  [yellow]GPU {i}: {e}[/]")
+
+    if not encoders:
+        console.print("  [yellow]⚠ No GPU with sufficient VRAM — using CPU[/]")
+        encoders = [SentenceTransformer(model_name, device="cpu",
+                                         trust_remote_code=True)]
+    elif len(encoders) > 1:
+        console.print(f"  [green]✓ Dual-GPU embedding: {len(encoders)} encoders[/]")
+    return encoders
+
+
 def safe_dest(dst_dir: Path, src: Path) -> Path:
-    """Return a non-colliding destination path inside dst_dir."""
     dst = dst_dir / src.name
     if not dst.exists():
         return dst
@@ -88,6 +138,44 @@ def safe_dest(dst_dir: Path, src: Path) -> Path:
         if not candidate.exists():
             return candidate
     raise RuntimeError(f"Cannot find free name for {src.name} in {dst_dir}")
+
+
+def extract_window(files: list, workers: int, maxtasks: int,
+                   ocr_reader, skip_ocr: bool, max_ocr_pages: int,
+                   progress, task):
+    """Extract text from a window of files. Returns (texts_map, no_text_files)."""
+    texts_map = {}
+    needs_ocr = []
+    needs_seq = []
+
+    with Pool(processes=workers, maxtasksperchild=maxtasks) as pool:
+        ars = [(f, pool.apply_async(_extract_cpu, (str(f),))) for f in files]
+        for f, ar in ars:
+            try:
+                _, text = ar.get(timeout=60)
+                if text.strip():
+                    texts_map[f] = text
+                else:
+                    needs_ocr.append(f)
+            except Exception:
+                needs_seq.append(f)
+            progress.advance(task)
+
+    for f in needs_seq:
+        text = extract_text(f, ocr_reader=None)
+        if text.strip():
+            texts_map[f] = text
+        else:
+            needs_ocr.append(f)
+
+    if not skip_ocr and ocr_reader is not None:
+        for f in sorted(needs_ocr):
+            text = extract_text(f, ocr_reader, max_ocr_pages=max_ocr_pages)
+            if text.strip():
+                texts_map[f] = text
+
+    no_text = [f for f in files if f not in texts_map]
+    return texts_map, no_text
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -101,21 +189,26 @@ def main():
     parser.add_argument("-o", "--output", default="./sorted_output",
                         help="Output directory (created if absent)")
     parser.add_argument("--mode", choices=["copy", "symlink", "report"],
-                        default="copy",
-                        help="copy=copy files, symlink=create symlinks, report=CSV only")
+                        default="copy")
     parser.add_argument("--threshold", type=float, default=0.40,
                         help="Confidence below this → _review/ (default 0.40)")
     parser.add_argument("--workers", type=int,
-                        default=min(16, max(1, (os.cpu_count() or 4) - 2)),
-                        help="Parallel CPU extraction processes")
-    parser.add_argument("--batch", type=int, default=256,
-                        help="Documents per embedding batch (default 256)")
+                        default=min(24, max(1, (os.cpu_count() or 4) - 2)),
+                        help="Parallel CPU extraction processes (default: cpu_count-2, max 24)")
+    parser.add_argument("--maxtasks", type=int, default=20,
+                        help="Pool maxtasksperchild — 20 cuts fork overhead, 1=max isolation")
+    parser.add_argument("--batch", type=int, default=512,
+                        help="Documents per streaming window (default 512)")
+    parser.add_argument("--encode-batch", type=int, default=512,
+                        help="encoder.encode internal GPU batch size (default 512)")
     parser.add_argument("--chunk-chars", type=int, default=4000,
                         help="Characters per text chunk (default 4000)")
     parser.add_argument("--skip-ocr", action="store_true",
                         help="skip GPU OCR — image-only files go to _review/ (fast)")
     parser.add_argument("--max-ocr-pages", type=int, default=0,
-                        help="limit OCR to first N pages per file (0=all, try 3-5 for speed)")
+                        help="limit OCR to first N pages (0=all)")
+    parser.add_argument("--single-gpu", action="store_true",
+                        help="disable dual-GPU embedding (use only the best single GPU)")
     args = parser.parse_args()
 
     source  = Path(args.source)
@@ -129,33 +222,34 @@ def main():
         console.print(f"[red]ERROR: model not found: {model_p}[/]")
         sys.exit(1)
 
-    # ── Load model ────────────────────────────────────────────────────────────
     console.print(Panel(
         f"[bold white]sort_docs[/]  [dim]bulk classify & sort[/]\n\n"
-        f"  source    [cyan]{source}[/]\n"
-        f"  model     [cyan]{model_p.name}[/]\n"
-        f"  output    [cyan]{output}[/]\n"
-        f"  mode      [green]{args.mode}[/]  "
-        f"  threshold [yellow]{args.threshold:.0%}[/]  "
-        f"  workers   [green]{args.workers}[/]",
+        f"  source       [cyan]{source}[/]\n"
+        f"  model        [cyan]{model_p.name}[/]\n"
+        f"  output       [cyan]{output}[/]\n"
+        f"  mode         [green]{args.mode}[/]  "
+        f"threshold [yellow]{args.threshold:.0%}[/]\n"
+        f"  workers      [green]{args.workers}[/]  "
+        f"maxtasks [green]{args.maxtasks}[/]  "
+        f"batch [green]{args.batch}[/]  "
+        f"encode-batch [green]{args.encode_batch}[/]",
         style="green", padding=(0, 2),
     ))
 
-    bundle = joblib.load(model_p)
+    bundle      = joblib.load(model_p)
     clf         = bundle["clf"]
     embed_model = bundle.get("embed_model", "BAAI/bge-m3")
     chunk_chars = bundle.get("chunk_chars", args.chunk_chars)
     classes     = clf.classes_
 
-    encoder    = get_encoder(embed_model)
-    device     = str(encoder.device)
+    console.print(f"\n[bold cyan]▶ Loading encoder(s)[/] — dual GPU: {not args.single_gpu} ...")
+    encoders = load_encoders(embed_model, single_gpu=args.single_gpu)
+
+    device     = str(encoders[0].device)
     ocr_reader = None if args.skip_ocr else get_ocr_reader(device)
     if args.skip_ocr:
         console.print("  [dim]--skip-ocr: GPU OCR disabled — image-only files → _review/[/]")
-    elif args.max_ocr_pages:
-        console.print(f"  [dim]--max-ocr-pages {args.max_ocr_pages}: OCR limited to first {args.max_ocr_pages} pages[/]")
 
-    # ── Scan files ────────────────────────────────────────────────────────────
     console.print("\n[bold]Scanning source directory ...[/]")
     all_files = sorted(
         f for f in source.rglob("*")
@@ -163,93 +257,65 @@ def main():
     )
     console.print(f"  Found [green]{len(all_files):,}[/] files\n")
 
-    # ── Phase A: parallel CPU extraction ─────────────────────────────────────
-    texts_map   = {}   # Path → text string
-    needs_ocr   = []
-    needs_seq   = []
+    # ── Streaming pipeline: extract window → embed window → next window ────────
+    all_results  = []   # (Path, proba_array)
+    no_text_files = []
+    t0_total = time.time()
+
+    n_windows = (len(all_files) + args.batch - 1) // args.batch
+    console.print(f"[bold]Processing {n_windows} windows "
+                  f"({args.batch} files each) ...[/]\n")
 
     with _make_progress() as progress:
-        task = progress.add_task(
-            f"[cyan]CPU extract[/] ({args.workers} workers)", total=len(all_files))
-        with Pool(processes=args.workers, maxtasksperchild=1) as pool:
-            async_results = [(f, pool.apply_async(_extract_cpu, (str(f),)))
-                             for f in all_files]
-            for f, ar in async_results:
-                try:
-                    _, text = ar.get(timeout=60)
-                    if text.strip():
-                        texts_map[f] = text
-                    else:
-                        needs_ocr.append(f)
-                except Exception:
-                    needs_seq.append(f)
-                progress.advance(task)
+        task_extract = progress.add_task(
+            f"[cyan]CPU extract[/] ({args.workers}w maxtasks={args.maxtasks})",
+            total=len(all_files))
+        task_embed = progress.add_task(
+            f"[blue]GPU embed[/] (encode-batch={args.encode_batch})",
+            total=n_windows)
 
-        # Phase A fallback
-        if needs_seq:
-            task_seq = progress.add_task(
-                "[yellow]sequential fallback[/]", total=len(needs_seq))
-            for f in needs_seq:
-                text = extract_text(f, ocr_reader=None)
-                if text.strip():
-                    texts_map[f] = text
-                else:
-                    needs_ocr.append(f)
-                progress.advance(task_seq)
+        for w in range(n_windows):
+            window = all_files[w * args.batch:(w + 1) * args.batch]
 
-        # Phase B: GPU OCR (skipped if --skip-ocr)
-        if needs_ocr and ocr_reader is not None:
-            task_ocr = progress.add_task(
-                f"[magenta]GPU OCR[/]"
-                + (f" [dim](max {args.max_ocr_pages} pages)[/]" if args.max_ocr_pages else ""),
-                total=len(needs_ocr))
-            for f in sorted(needs_ocr):
-                text = extract_text(f, ocr_reader,
-                                    max_ocr_pages=args.max_ocr_pages)
-                if text.strip():
-                    texts_map[f] = text
-                progress.advance(task_ocr)
+            # Extract this window
+            texts_map, no_text = extract_window(
+                window, args.workers, args.maxtasks,
+                ocr_reader, args.skip_ocr, args.max_ocr_pages,
+                progress, task_extract,
+            )
+            no_text_files.extend(no_text)
 
-    console.print(f"  Extracted text from [green]{len(texts_map):,}[/] / "
-                  f"{len(all_files):,} files  "
-                  f"([dim]{len(all_files)-len(texts_map):,} no extractable text → _review[/])\n")
+            # Embed + predict immediately (GPU active, CPU free for next window)
+            if texts_map:
+                files_w = list(texts_map.keys())
+                texts_w = [texts_map[f] for f in files_w]
+                vecs = embed_batch_dual(texts_w, encoders, chunk_chars,
+                                        args.encode_batch)
+                probas = clf.predict_proba(vecs)
+                for f, proba in zip(files_w, probas):
+                    all_results.append((f, proba))
 
-    # ── Phase C: batch embedding + prediction ─────────────────────────────────
-    extracted_files = list(texts_map.keys())
-    extracted_texts = [texts_map[f] for f in extracted_files]
-    n_batches = (len(extracted_files) + args.batch - 1) // args.batch
-
-    all_probas = []
-    t0_embed = time.time()
-
-    with _make_progress() as progress:
-        task_emb = progress.add_task(
-            f"[blue]Embedding[/] (batch={args.batch})", total=n_batches)
-        for i in range(n_batches):
-            batch_texts = extracted_texts[i*args.batch:(i+1)*args.batch]
-            vecs = embed_batch(batch_texts, encoder, chunk_chars)
-            all_probas.append(clf.predict_proba(vecs))
             gpu_str = _gpu_stat()
             console.print(
-                f"  batch {i+1}/{n_batches}  "
-                f"[green]{len(batch_texts)}[/] docs  {gpu_str}")
-            progress.advance(task_emb)
+                f"  window {w+1}/{n_windows}  "
+                f"extracted [green]{len(texts_map)}[/]  "
+                f"no-text [dim]{len(no_text)}[/]  {gpu_str}")
+            progress.advance(task_embed)
 
-    embed_elapsed = time.time() - t0_embed
-    all_probas = np.vstack(all_probas)
-    console.print(f"  Embedded [green]{len(extracted_files):,}[/] docs "
-                  f"in [cyan]{embed_elapsed/60:.1f} min[/]\n")
+    elapsed = time.time() - t0_total
+    total_extracted = len(all_results)
+    console.print(
+        f"\n  [green]{total_extracted:,}[/] docs embedded in "
+        f"[cyan]{elapsed/60:.1f} min[/]  "
+        f"({total_extracted / max(elapsed, 1):.0f} docs/s)\n")
 
-    # ── Phase D: sort files ───────────────────────────────────────────────────
-    results = []   # (Path, class_name, confidence, 2nd_class, 2nd_conf)
+    # ── Build results list ─────────────────────────────────────────────────────
+    results = []
+    for f in no_text_files:
+        results.append((f, "_review", 0.0, "", 0.0))
 
-    # Files with no text → _review
-    for f in all_files:
-        if f not in texts_map:
-            results.append((f, "_review", 0.0, "", 0.0))
-
-    for f, proba in zip(extracted_files, all_probas):
-        order = proba.argsort()[::-1]
+    for f, proba in all_results:
+        order    = proba.argsort()[::-1]
         best_cls  = classes[order[0]]
         best_conf = float(proba[order[0]])
         sec_cls   = classes[order[1]] if len(order) > 1 else ""
@@ -257,9 +323,9 @@ def main():
         cls = best_cls if best_conf >= args.threshold else "_review"
         results.append((f, cls, best_conf, sec_cls, sec_conf))
 
+    # ── Sort files ─────────────────────────────────────────────────────────────
     if args.mode != "report":
         output.mkdir(parents=True, exist_ok=True)
-
         with _make_progress() as progress:
             task_sort = progress.add_task(
                 f"[white]Sorting ({args.mode})[/]", total=len(results))
@@ -276,14 +342,9 @@ def main():
                     console.print(f"  [yellow]⚠ {f.name}: {exc}[/]")
                 progress.advance(task_sort)
 
-    # ── Write CSV report ──────────────────────────────────────────────────────
-    report_path = (output / "sort_report.csv") if args.mode != "report" \
-                  else Path("sort_report.csv")
-    if args.mode == "report":
-        output.mkdir(parents=True, exist_ok=True)
-        report_path = output / "sort_report.csv"
-
+    # ── CSV report ─────────────────────────────────────────────────────────────
     output.mkdir(parents=True, exist_ok=True)
+    report_path = output / "sort_report.csv"
     with open(report_path, "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["filename", "predicted_class", "confidence",
@@ -292,18 +353,17 @@ def main():
             w.writerow([f.name, cls, f"{conf:.3f}", sec_cls,
                         f"{sec_conf:.3f}", str(f)])
 
-    # ── Summary table ─────────────────────────────────────────────────────────
+    # ── Summary ────────────────────────────────────────────────────────────────
     counts = Counter(cls for _, cls, _, _, _ in results)
     t = Table(title="[bold green]Sort summary[/]", box=box.SIMPLE,
-              border_style="green", show_lines=False)
+              border_style="green")
     t.add_column("Class", style="cyan")
     t.add_column("Files", justify="right", style="green")
     t.add_column("Bar", style="dim")
     total = len(results)
-    bar_max = 30
     for cls, n in sorted(counts.items(), key=lambda x: -x[1]):
-        bar = "█" * int(bar_max * n / max(counts.values()))
-        pct = f"{100*n/total:.1f}%"
+        bar   = "█" * int(30 * n / max(counts.values()))
+        pct   = f"{100*n/total:.1f}%"
         label = f"[yellow]{cls}[/]" if cls == "_review" else cls
         t.add_row(label, f"{n:,} ({pct})", f"[dim]{bar}[/]")
     t.add_row("[bold]TOTAL[/]", f"[bold green]{total:,}[/]", "")
