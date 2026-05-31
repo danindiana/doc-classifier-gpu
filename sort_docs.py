@@ -169,17 +169,19 @@ def extract_window(files: list, workers: int, maxtasks: int,
     needs_seq = []
 
     with Pool(processes=workers, maxtasksperchild=maxtasks) as pool:
-        ars = [(f, pool.apply_async(_extract_cpu, (str(f),))) for f in files]
-        for f, ar in ars:
-            try:
-                _, text = ar.get(timeout=60)
+        try:
+            for path_str, text in pool.imap_unordered(
+                    _extract_cpu, [str(f) for f in files], chunksize=1):
+                f = Path(path_str)
                 if text.strip():
                     texts_map[f] = text
                 else:
                     needs_ocr.append(f)
-            except Exception:
-                needs_seq.append(f)
-            progress.advance(task)
+                progress.advance(task)
+        except Exception:
+            # Worker crashed mid-batch — fall back remaining files to sequential
+            done = set(texts_map) | set(needs_ocr)
+            needs_seq.extend(f for f in files if f not in done)
 
     for f in needs_seq:
         text = extract_text(f, ocr_reader=None)
@@ -215,8 +217,8 @@ def main():
     parser.add_argument("--workers", type=int,
                         default=min(12, max(1, (os.cpu_count() or 4) - 2)),
                         help="Parallel CPU extraction processes (default: min(12, cpu_count-2))")
-    parser.add_argument("--maxtasks", type=int, default=20,
-                        help="Pool maxtasksperchild — 20 cuts fork overhead, 1=max isolation")
+    parser.add_argument("--maxtasks", type=int, default=50,
+                        help="Pool maxtasksperchild — 50 avoids restarts within a 512-file window, 1=max isolation")
     parser.add_argument("--batch", type=int, default=512,
                         help="Documents per streaming window (default 512)")
     parser.add_argument("--encode-batch", type=int, default=512,
