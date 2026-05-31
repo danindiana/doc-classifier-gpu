@@ -418,9 +418,17 @@ def main():
             # 'spawn' start method gives each subprocess a fresh Python heap,
             # avoiding the glibc corruption that occurs with two SentenceTransformer
             # instances in one process.
-            ctx    = mp.get_context('spawn')
-            in_qs  = [ctx.Queue(), ctx.Queue()]
-            out_qs = [ctx.Queue(), ctx.Queue()]
+            #
+            # IMPORTANT: use mp.Manager().Queue() NOT ctx.Queue().
+            # ctx.Queue() starts feeder threads in the main process; when Pool()
+            # later forks the extraction workers, they inherit locked mutexes from
+            # those threads → silent deadlock (all workers stuck on futex_).
+            # Manager queues use a server process + sockets — no shared locks,
+            # fully fork-safe.
+            ctx     = mp.get_context('spawn')
+            manager = mp.Manager()
+            in_qs   = [manager.Queue(), manager.Queue()]
+            out_qs  = [manager.Queue(), manager.Queue()]
             procs  = []
             for i in range(2):
                 p = ctx.Process(
@@ -515,6 +523,7 @@ def main():
                 if p.is_alive():
                     p.terminate()
             collector.join()         # wait for all results to be merged
+            manager.shutdown()       # tear down the manager server process
 
     elapsed = time.time() - t0_total
     total_extracted = len(all_results)
