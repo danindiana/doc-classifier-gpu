@@ -1,0 +1,6 @@
+*.joblib
+usafa_sorted/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store

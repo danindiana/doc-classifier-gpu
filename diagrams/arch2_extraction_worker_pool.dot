@@ -1,0 +1,87 @@
+digraph Arch2_Extraction_Worker_Pool {
+    graph [
+        label="Extraction Worker Pool — _extract_class() Three-Phase Design"
+        labelloc=t
+        fontname="Helvetica" fontsize=16
+        bgcolor="#1a1a2e" fontcolor="#e0e0e0"
+        rankdir=TB splines=ortho
+        pad=0.6 nodesep=0.6 ranksep=0.9
+    ]
+    node [fontname="Helvetica" fontsize=11 style=filled shape=box]
+    edge [fontname="Helvetica" fontsize=10 color="#aaaaaa" fontcolor="#cccccc"]
+
+    entry [label="label_dir\n(one class folder)"
+           fillcolor="#2a2a5a" fontcolor="white" shape=ellipse]
+
+    subgraph cluster_phaseA {
+        label="Phase A — Parallel CPU Extraction" fontcolor="#e0e0e0" fontsize=12
+        color="#335533" style=filled fillcolor="#111a11"
+
+        ppe_ctx [label="ProcessPoolExecutor\nmax_workers=14" fillcolor="#2a4a2a" fontcolor="white"]
+
+        subgraph cluster_workers {
+            label="Worker Processes (separate Python interpreters)" fontcolor="#cccccc"
+            color="#224422" style=dashed
+            w0 [label="Worker 0\n_extract_cpu(path)" fillcolor="#1e3a1e" fontcolor="white"]
+            w1 [label="Worker 1\n_extract_cpu(path)" fillcolor="#1e3a1e" fontcolor="white"]
+            wn [label="Worker N-1\n_extract_cpu(path)" fillcolor="#1e3a1e" fontcolor="white"]
+            w0 -> w1 [style=invis]
+            w1 -> wn [style=invis label="  ..."]
+        }
+
+        as_completed [label="as_completed(futures)\nper-future try/except" fillcolor="#2a4a2a" fontcolor="white" shape=diamond]
+        fut_ok  [label="text → cpu_texts[]" fillcolor="#224422" fontcolor="white"]
+        fut_empty [label="no text → needs_ocr[]" fillcolor="#3a3322" fontcolor="white"]
+        fut_err [label="worker exception →\nneeds_sequential[]" fillcolor="#5a2a00" fontcolor="white"]
+        bpp [label="except BrokenProcessPool\nunfinished files →\nneeds_sequential[]"
+             fillcolor="#6a2200" fontcolor="white" shape=diamond]
+
+        ppe_ctx -> w0
+        ppe_ctx -> w1
+        ppe_ctx -> wn
+        w0 -> as_completed [label="future"]
+        w1 -> as_completed [label="future"]
+        wn -> as_completed [label="future"]
+        as_completed -> fut_ok   [label="has text"]
+        as_completed -> fut_empty [label="empty"]
+        as_completed -> fut_err  [label="exception" color="#cc6600"]
+        ppe_ctx -> bpp [label="pool dies" style=dashed color="#ff4400"]
+    }
+
+    subgraph cluster_phaseB {
+        label="Phase B — Sequential CPU Fallback" fontcolor="#e0e0e0" fontsize=12
+        color="#664400" style=filled fillcolor="#1a1000"
+
+        seq_loop [label="for f in needs_sequential:\n  extract_text(f, ocr_reader=None)"
+                  fillcolor="#3a2200" fontcolor="white"]
+        seq_ok   [label="text → cpu_texts[]" fillcolor="#3a2200" fontcolor="white"]
+        seq_empty [label="no text → needs_ocr[]" fillcolor="#3a2200" fontcolor="white"]
+
+        seq_loop -> seq_ok   [label="has text"]
+        seq_loop -> seq_empty [label="empty"]
+    }
+
+    subgraph cluster_phaseC {
+        label="Phase C — Sequential GPU OCR" fontcolor="#e0e0e0" fontsize=12
+        color="#334466" style=filled fillcolor="#10101a"
+
+        ocr_loop [label="for f in sorted(needs_ocr):\n  EasyOCR + PyMuPDF" fillcolor="#223355" fontcolor="white"]
+        ocr_ok   [label="text → ocr_texts[]" fillcolor="#223355" fontcolor="white"]
+        ocr_skip [label="(skipped)\nno legible text" fillcolor="#2a2a3a" fontcolor="#aaaaaa"]
+
+        ocr_loop -> ocr_ok   [label="has text"]
+        ocr_loop -> ocr_skip [label="empty"]
+    }
+
+    result [label="cpu_texts + ocr_texts\n→ embed_documents()"
+            fillcolor="#2a2a6a" fontcolor="white" shape=ellipse]
+
+    entry -> ppe_ctx
+    fut_err -> seq_loop [color="#cc6600"]
+    bpp -> seq_loop [color="#ff4400"]
+    fut_empty -> ocr_loop
+    seq_empty -> ocr_loop
+    fut_ok -> result
+    seq_ok -> result
+    ocr_ok -> result
+}

@@ -1,0 +1,103 @@
+graph Dot4_Class_Geometry {
+    graph [
+        label="Semantic Neighborhoods on the Hypersphere\n(classes that are close together in embedding space)"
+        labelloc=t fontname="Helvetica" fontsize=16
+        bgcolor="#1a1a2e" fontcolor="#e0e0e0"
+        pad=0.7 nodesep=0.5 ranksep=0.8 splines=true
+    ]
+    node [fontname="Helvetica" fontsize=10 style=filled shape=box]
+    edge [fontname="Helvetica" fontsize=9 color="#555577"]
+
+    // Military doctrine cluster
+    subgraph cluster_doctrine {
+        label="Military Doctrine" fontcolor="#76b900" color="#335500" style=filled fillcolor="#0a1400"
+        node [fillcolor="#1a3a00" fontcolor="#76b900"]
+        strategy; tactics; LSCO; C2; hybrid_threat; COIN;
+        unconventional_warfare [label="unconventional\nwarfare"]
+        stability_operations  [label="stability\noperations"]
+        strategy -- tactics
+        tactics -- LSCO
+        LSCO -- C2
+        C2 -- hybrid_threat
+        hybrid_threat -- COIN
+        COIN -- unconventional_warfare
+        tactics -- stability_operations
+    }
+
+    // Weapons / ordnance cluster
+    subgraph cluster_weapons {
+        label="Weapons & Ordnance" fontcolor="#cc4422" color="#552200" style=filled fillcolor="#1a0500"
+        node [fillcolor="#3a1000" fontcolor="#ff8866"]
+        weapons; mines; mortars; energetics
+        chemical_weapons [label="chemical\nweapons"]
+        improvised_weapons [label="improvised\nweapons"]
+        weapons -- mines
+        weapons -- mortars
+        weapons -- energetics
+        energetics -- chemical_weapons
+        weapons -- improvised_weapons
+    }
+
+    // Intel / psyops cluster
+    subgraph cluster_intel {
+        label="Intel & Information Ops" fontcolor="#4477ff" color="#223366" style=filled fillcolor="#000a1a"
+        node [fillcolor="#0a1a3a" fontcolor="#6699ff"]
+        INFOWAR; Psyop; Intel; intelligence
+        deception_operations [label="deception\noperations"]
+        Media_Affairs [label="Media\nAffairs"]
+        INFOWAR -- Psyop
+        Psyop -- deception_operations
+        Intel -- intelligence
+        INFOWAR -- Media_Affairs
+        intelligence -- deception_operations
+    }
+
+    // Medical / physical cluster
+    subgraph cluster_medical {
+        label="Medical & Physical" fontcolor="#44cccc" color="#224444" style=filled fillcolor="#001414"
+        node [fillcolor="#0a2a2a" fontcolor="#66eeee"]
+        medical
+        Combat_Medicine [label="Combat\nMedicine"]
+        physiology; physical_training [label="physical\ntraining"]
+        medical -- Combat_Medicine
+        medical -- physiology
+        physiology -- physical_training
+    }
+
+    // Technology cluster
+    subgraph cluster_tech {
+        label="Technology" fontcolor="#aa44ff" color="#442266" style=filled fillcolor="#0a0014"
+        node [fillcolor="#1a0a2a" fontcolor="#cc88ff"]
+        Robotics; Drones
+        Artificial_Intelligence [label="Artificial\nIntelligence"]
+        Computers_Data [label="Computers\n& Data"]
+        Remote_Sensing [label="Remote\nSensing"]
+        Robotics -- Drones
+        Drones -- Artificial_Intelligence
+        Artificial_Intelligence -- Computers_Data
+        Remote_Sensing -- Drones
+    }
+
+    // Geography / terrain cluster
+    subgraph cluster_geo {
+        label="Geography & Terrain" fontcolor="#ffcc44" color="#443300" style=filled fillcolor="#1a1000"
+        node [fillcolor="#2a2000" fontcolor="#ffee88"]
+        geography; gis
+        Forest_hiking [label="Forest\nHiking"]
+        jungle_operations [label="jungle\noperations"]
+        geography -- gis
+        gis -- Forest_hiking
+        Forest_hiking -- jungle_operations
+    }
+
+    // Cross-cluster edges (near on hypersphere)
+    edge [style=dashed color="#445555" fontcolor="#8899aa" fontsize=9]
+    strategy -- Intel         [label="strategic intel"]
+    C2 -- Computers_Data      [label="C2 systems"]
+    INFOWAR -- Psyop          [style=solid color="#6699ff"]
+    weapons -- energetics     [style=solid color="#ff8866"]
+    geography -- gis          [style=solid color="#ffee88"]
+    jungle_operations -- Forest_hiking [style=solid color="#ffee88"]
+    Drones -- Remote_Sensing  [style=solid color="#cc88ff"]
+    tactics -- unconventional_warfare [style=solid color="#76b900"]
+}

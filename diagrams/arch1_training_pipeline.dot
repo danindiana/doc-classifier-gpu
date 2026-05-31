@@ -1,0 +1,79 @@
+digraph Arch1_Training_Pipeline {
+    graph [
+        label="doc_classifier_gpu — Full Training Pipeline"
+        labelloc=t
+        fontname="Helvetica" fontsize=16
+        bgcolor="#1a1a2e" fontcolor="#e0e0e0"
+        rankdir=LR splines=ortho
+        pad=0.6 nodesep=0.5 ranksep=1.1
+    ]
+    node [fontname="Helvetica" fontsize=11 style=filled shape=box]
+    edge [fontname="Helvetica" fontsize=10 color="#aaaaaa" fontcolor="#cccccc"]
+
+    subgraph cluster_corpus {
+        label="Training Corpus" fontcolor="#e0e0e0" fontsize=12
+        color="#444466" style=dashed
+        corpus [label="2026-05-28_militia-copy/\n69 class sub-folders\n~1887 PDFs + images"
+                fillcolor="#2a2a5a" fontcolor="white" shape=cylinder]
+        classes [label="class_dir[0..68]\n(sub-folder = label)"
+                 fillcolor="#333366" fontcolor="white"]
+        corpus -> classes [label="iterdir()"]
+    }
+
+    subgraph cluster_extract {
+        label="Per-Class Extraction  (_extract_class)" fontcolor="#e0e0e0" fontsize=12
+        color="#335533" style=dashed
+
+        ppe [label="ProcessPoolExecutor\n14 workers\n_extract_cpu(path)"
+             fillcolor="#2a4a2a" fontcolor="white"]
+        bpp [label="BrokenProcessPool\ncatch → sequential\nfallback" shape=diamond
+             fillcolor="#6a3a00" fontcolor="white"]
+        cpu_seq [label="Sequential CPU fallback\nextract_text(f, ocr_reader=None)"
+                 fillcolor="#3a2a00" fontcolor="white"]
+        ocr [label="EasyOCR + PyMuPDF\nGPU OCR\n(image PDFs + .jpg/.png)"
+             fillcolor="#2a3a5a" fontcolor="white"]
+
+        ppe -> bpp [label="worker dies" style=dashed color="#cc6600"]
+        bpp -> cpu_seq [color="#cc6600"]
+        ppe -> ocr [label="empty text\n(no text layer)" style=dashed]
+        cpu_seq -> ocr [label="empty text" style=dashed]
+    }
+
+    subgraph cluster_embed {
+        label="Per-Class Embedding  (embed_documents)" fontcolor="#e0e0e0" fontsize=12
+        color="#444488" style=dashed
+
+        chunk [label="chunk_text()\n4000-char chunks\n200-char overlap"
+               fillcolor="#333366" fontcolor="white"]
+        encode [label="bge-m3 SentenceTransformer\nGPU 0 (RTX 5080)\nbatch_size=32\nnormalize_embeddings=True"
+                fillcolor="#1a1a6a" fontcolor="white"]
+        pool [label="mean-pool chunks\nper document\n→ 1024-dim vector"
+              fillcolor="#333366" fontcolor="white"]
+
+        chunk -> encode -> pool
+    }
+
+    subgraph cluster_train {
+        label="Classifier Training" fontcolor="#e0e0e0" fontsize=12
+        color="#553333" style=dashed
+
+        stack [label="np.vstack(all_X)\ncollect embeddings\nacross all classes"
+               fillcolor="#3a2222" fontcolor="white"]
+        lr [label="LogisticRegression\nC=10.0  class_weight=balanced\nmax_iter=5000"
+            fillcolor="#5a2222" fontcolor="white"]
+        cv [label="k-fold CV\naccuracy score"
+            fillcolor="#3a2222" fontcolor="white"]
+        model [label="militia.joblib\n{clf, embed_model,\nchunk_chars}"
+               fillcolor="#6a1a1a" fontcolor="white" shape=cylinder]
+
+        stack -> lr -> cv
+        lr -> model [label="joblib.dump()"]
+    }
+
+    classes -> ppe
+    ppe -> chunk [label="texts[]"]
+    ocr -> chunk [label="OCR text"]
+    cpu_seq -> chunk [label="text"]
+    pool -> stack
+    stack -> lr
+}

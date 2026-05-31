@@ -1,0 +1,88 @@
+digraph Incident1_BrokenProcessPool {
+    graph [
+        label="Incident: BrokenProcessPool — Root Cause Analysis & Fix"
+        labelloc=t
+        fontname="Helvetica" fontsize=16
+        bgcolor="#1a1a2e" fontcolor="#e0e0e0"
+        rankdir=TB splines=ortho
+        pad=0.6 nodesep=0.7 ranksep=0.9
+    ]
+    node [fontname="Helvetica" fontsize=11 style=filled shape=box]
+    edge [fontname="Helvetica" fontsize=10 color="#aaaaaa" fontcolor="#cccccc"]
+
+    root [label="BrokenProcessPool\nconcurrent.futures.process\nTraining crashed — no militia.joblib"
+          fillcolor="#8b0000" fontcolor="white" shape=diamond]
+
+    subgraph cluster_symptom {
+        label="Symptom" fontcolor="#e0e0e0" color="#553333" style=dashed
+        symptom [label="Worker process killed abruptly\nwhile future was running or pending\nAll pending futures poisoned"
+                 fillcolor="#5a1a1a" fontcolor="white"]
+    }
+
+    subgraph cluster_ruled_out {
+        label="Ruled Out" fontcolor="#e0e0e0" color="#444444" style=dashed
+        oom [label="OOM killer ✗\n101 GB RAM free\ndmesg: no oom events"
+             fillcolor="#2a2a2a" fontcolor="#888888"]
+        ulimit [label="ulimit ✗\ndata seg: unlimited\nvirtual: unlimited"
+                fillcolor="#2a2a2a" fontcolor="#888888"]
+    }
+
+    subgraph cluster_cause {
+        label="Root Cause" fontcolor="#e0e0e0" color="#884400" style=filled fillcolor="#1a0a00"
+
+        pillow [label="Pillow C extension\n_imaging.cpython-310-x86_64-linux-gnu.so\n(one of 8 .so files in Pillow)"
+                fillcolor="#6a3300" fontcolor="white"]
+        embedded [label="PDF contains embedded image\n(Liberated_manuals corpus —\n706 files, several >1M chars)"
+                  fillcolor="#5a2200" fontcolor="white"]
+        corrupt  [label="Corrupt image data\nin PDF binary stream"
+                  fillcolor="#6a1a00" fontcolor="white"]
+        segfault [label="SIGSEGV in C code\nNo Python exception handler\nWorker process killed by OS"
+                  fillcolor="#8b1a00" fontcolor="white" shape=diamond]
+        poison  [label="pool.__exit__() sees dead worker\nRaises BrokenProcessPool\nAll pending futures cancelled"
+                 fillcolor="#6a0000" fontcolor="white"]
+
+        embedded -> pillow [label="pdfplumber calls Pillow"]
+        corrupt -> pillow  [label="fed to"]
+        pillow -> segfault [label="C crash"]
+        segfault -> poison [label="kills worker"]
+    }
+
+    subgraph cluster_wrong_fix {
+        label="Wrong Fix (v5 — 8c0c8a6)" fontcolor="#e0e0e0" color="#665500" style=filled fillcolor="#111000"
+
+        thread [label="ThreadPoolExecutor\n(replaced ProcessPoolExecutor)"
+                fillcolor="#554400" fontcolor="white"]
+        gil [label="GIL — Global Interpreter Lock\npdfminer / pdfplumber / pypdf\n= pure Python, zero .so files\n→ threads serialize, one runs at a time"
+             fillcolor="#443300" fontcolor="white"]
+        no_parallel [label="14 'workers' but sequential throughput\nNo actual CPU parallelism"
+                     fillcolor="#443300" fontcolor="#ffaa00"]
+
+        thread -> gil [label="blocked by"]
+        gil -> no_parallel
+    }
+
+    subgraph cluster_fix {
+        label="Correct Fix (v6 — e2f2d30)" fontcolor="#e0e0e0" color="#225522" style=filled fillcolor="#001000"
+
+        restore [label="ProcessPoolExecutor restored\n(true parallelism — separate interpreters)"
+                 fillcolor="#1a4a1a" fontcolor="white"]
+        guard1  [label="Per-future try/except\nindividual worker exceptions\n→ needs_sequential[]"
+                 fillcolor="#224422" fontcolor="white"]
+        guard2  [label="except BrokenProcessPool\ncollect unfinished files\n→ needs_sequential[]"
+                 fillcolor="#224422" fontcolor="white"]
+        seq_fb  [label="Sequential fallback\nextract_text(f, None)\nTrain survives worker segfault"
+                 fillcolor="#2a5a2a" fontcolor="white"]
+
+        restore -> guard1
+        restore -> guard2
+        guard1 -> seq_fb
+        guard2 -> seq_fb
+    }
+
+    root -> symptom
+    symptom -> oom   [label="investigated" style=dashed color="#666666"]
+    symptom -> ulimit [label="investigated" style=dashed color="#666666"]
+    symptom -> embedded [label="actual cause" color="#ff6600"]
+    root -> thread [label="first fix attempt" color="#cc9900"]
+    root -> restore [label="final fix" color="#44aa44"]
+}

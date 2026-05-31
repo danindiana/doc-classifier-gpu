@@ -1,0 +1,42 @@
+digraph Evol1_Script_Versions {
+    graph [
+        label="doc_classifier_gpu.py — Script Evolution (v1 → v6)"
+        labelloc=t
+        fontname="Helvetica" fontsize=16
+        bgcolor="#1a1a2e" fontcolor="#e0e0e0"
+        rankdir=TB splines=ortho
+        pad=0.6 nodesep=0.4 ranksep=0.7
+    ]
+    node [fontname="Helvetica" fontsize=11 style=filled shape=box]
+    edge [fontname="Helvetica" fontsize=10 color="#aaaaaa" fontcolor="#cccccc"]
+
+    v1 [label="v1  ·  f82cd48\nBaseline GPU classifier\n─────────────────────\n• extract_text() for PDFs + text files\n• load_dataset() → extract ALL → embed ALL\n• GPU idle entire extraction phase\n• No verbose output\n• No OCR"
+        fillcolor="#333366" fontcolor="white"]
+
+    v2 [label="v2  ·  d138ab5 (part 1)\nInterleaved + verbose output\n─────────────────────\n• Per-file print with flush trick\n  (filename appears before extraction)\n• train() restructured: per-class\n  extract → GPU embed → next class\n• GPU fires after each class,\n  not only after all extraction done\n• get_encoder() called before loop"
+        fillcolor="#224422" fontcolor="white"]
+
+    v3 [label="v3  ·  d138ab5 (part 2)\nGPU OCR + parallel extraction\n─────────────────────\n• EasyOCR + PyMuPDF added\n  (image PDFs + .jpg/.png OCR'd on GPU)\n• IMAGE_SUFFIXES constant added\n• get_ocr_reader() function\n• _extract_class() helper\n• --workers flag (default cpu_count-2)"
+        fillcolor="#224433" fontcolor="white"]
+
+    v4 [label="v4  ·  d138ab5 (part 3)\nProcessPoolExecutor\n─────────────────────\n• True CPU parallelism\n  (separate Python interpreters)\n• 14 workers bypass GIL\n• CRASHED on Liberated_manuals\n  (706 files)"
+        fillcolor="#5a2200" fontcolor="white"]
+
+    crash [label="BrokenProcessPool\n─────────────────────\nPillow C ext segfault\non corrupt embedded image\nPoisons all pending futures"
+           fillcolor="#8b0000" fontcolor="white" shape=diamond]
+
+    v5 [label="v5  ·  8c0c8a6\nWRONG FIX: ThreadPoolExecutor\n─────────────────────\n• Switched to threads\n• GIL serializes pure-Python\n  pdfminer/pdfplumber/pypdf\n• 14 'workers' → sequential\n  throughput, no parallelism\n• Crash fixed but perf lost"
+        fillcolor="#664400" fontcolor="#ffcc44"]
+
+    v6 [label="v6  ·  e2f2d30  ← CURRENT\nProcessPoolExecutor + Resilience\n─────────────────────\n• ProcessPoolExecutor restored\n  (true parallelism)\n• Per-future try/except\n  individual worker exceptions\n• except BrokenProcessPool\n  collects unfinished files\n• Sequential fallback for\n  crashed workers\n• Training survives segfaults"
+        fillcolor="#1a4a1a" fontcolor="white" penwidth=2 color="#44ff44"]
+
+    v1 -> v2 [label="interleave + verbose"]
+    v2 -> v3 [label="EasyOCR + --workers"]
+    v3 -> v4 [label="ProcessPoolExecutor"]
+    v4 -> crash [label="crashes" color="#ff4400"]
+    crash -> v5 [label="wrong fix" color="#cc8800"]
+    v5 -> v6 [label="correct fix" color="#44aa44"]
+
+    {rank=same; v4; crash}
+}

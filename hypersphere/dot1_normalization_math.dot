@@ -1,0 +1,51 @@
+digraph Dot1_Normalization_Math {
+    graph [
+        label="L2 Normalization: Placing Vectors on the Unit Hypersphere"
+        labelloc=t fontname="Helvetica" fontsize=16
+        bgcolor="#1a1a2e" fontcolor="#e0e0e0"
+        rankdir=LR splines=ortho pad=0.6 nodesep=0.7 ranksep=1.1
+    ]
+    node [fontname="Helvetica" fontsize=11 style=filled shape=box]
+    edge [fontname="Helvetica" fontsize=10 color="#aaaaaa" fontcolor="#cccccc"]
+
+    doc   [label="Document\n(text content)"
+           fillcolor="#2a2a5a" fontcolor="white" shape=note]
+    enc   [label="bge-m3 Encoder\n(570M parameters, GPU)"
+           fillcolor="#1a1a6a" fontcolor="white"]
+    raw   [label="Raw vector  v\n1024 float32 values\n‖v‖ ≠ 1  (arbitrary magnitude)"
+           fillcolor="#333344" fontcolor="#e0e0e0"]
+    norm  [label="Compute magnitude\n‖v‖ = √( v₁² + v₂² + … + v₁₀₂₄² )"
+           fillcolor="#3a2200" fontcolor="#ffcc88" shape=ellipse]
+    unit  [label="Unit vector  v̂ = v / ‖v‖\n‖v̂‖ = 1.0  (guaranteed)"
+           fillcolor="#1a3a1a" fontcolor="#88ff88"]
+    sphere [label="Point on  S¹⁰²³\n(unit hypersphere\nin 1024 dimensions)"
+            fillcolor="#1a3a5a" fontcolor="#88ccff" shape=ellipse]
+
+    subgraph cluster_discard {
+        label="What is discarded" fontcolor="#cc4444" color="#553333" style=dashed
+        mag [label="Magnitude  ‖v‖\n(how long the vector is)\n→ irrelevant to meaning"
+             fillcolor="#3a1a1a" fontcolor="#cc8888"]
+    }
+
+    subgraph cluster_keep {
+        label="What is preserved" fontcolor="#44cc44" color="#335533" style=dashed
+        dir [label="Direction  v/‖v‖\n(which way it points)\n= the document's semantic content"
+             fillcolor="#1a3a1a" fontcolor="#88ff88"]
+    }
+
+    doc   -> enc   [label="text input"]
+    enc   -> raw   [label="encode()"]
+    raw   -> norm  [label="compute"]
+    norm  -> unit  [label="divide"]
+    unit  -> sphere [label="placed on"]
+
+    raw   -> mag   [label="throws away" style=dashed color="#cc4444" fontcolor="#cc4444"]
+    unit  -> dir   [label="retains" style=dashed color="#44cc44" fontcolor="#44cc44"]
+
+    subgraph cluster_why {
+        label="Why normalize?" fontcolor="#e0e0e0" color="#444466" style=dashed
+        why [label="Two docs on the same topic\nbut different lengths should land\nat the SAME point on the sphere.\nNormalization ensures this."
+             fillcolor="#2a2a44" fontcolor="#ccccff" shape=note]
+    }
+    sphere -> why [style=invis]
+}

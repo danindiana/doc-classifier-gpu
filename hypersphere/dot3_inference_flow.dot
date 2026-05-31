@@ -1,0 +1,57 @@
+digraph Dot3_Inference_Flow {
+    graph [
+        label="Classification Inference: Document → Prediction"
+        labelloc=t fontname="Helvetica" fontsize=16
+        bgcolor="#1a1a2e" fontcolor="#e0e0e0"
+        rankdir=TB splines=ortho pad=0.6 nodesep=0.6 ranksep=0.85
+    ]
+    node [fontname="Helvetica" fontsize=11 style=filled shape=box]
+    edge [fontname="Helvetica" fontsize=10 color="#aaaaaa" fontcolor="#cccccc"]
+
+    doc [label="New document\n(.pdf / .jpg / .txt)"
+         fillcolor="#2a2a5a" fontcolor="white" shape=note]
+
+    subgraph cluster_extract {
+        label="Text Extraction  (CPU)" fontcolor="#e0e0e0" color="#444466" style=dashed
+        ext [label="extract_text()\nPyMuPDF → text layer\nEasyOCR → GPU OCR fallback"
+             fillcolor="#333355" fontcolor="#aaaaff"]
+    }
+
+    subgraph cluster_chunk {
+        label="Chunking  (CPU)" fontcolor="#e0e0e0" color="#335533" style=dashed
+        chk [label="chunk_text(text, 4000, overlap=200)\n→ [chunk₀, chunk₁, … chunkₙ]\nn chunks of ≤4000 chars each"
+             fillcolor="#1a3a1a" fontcolor="#88ff88"]
+    }
+
+    subgraph cluster_encode {
+        label="Encoding  (GPU — RTX 5080)" fontcolor="#76b900" color="#335500" style=filled fillcolor="#0a1400"
+        enc  [label="bge-m3.encode(chunks, batch_size=32)\nnormalize_embeddings=True"
+              fillcolor="#1a3a00" fontcolor="#76b900"]
+        mat  [label="n × 1024  float32 matrix\n(one row per chunk)"
+              fillcolor="#1a2a00" fontcolor="#aae0aa"]
+        pool [label="mean_pool: average rows\n→ 1 × 1024  vector"
+              fillcolor="#1a3a00" fontcolor="#76b900"]
+        norm [label="L2 normalize\n→ unit vector  v̂  on S¹⁰²³\n‖v̂‖ = 1.0"
+              fillcolor="#2a3a00" fontcolor="#ccff88"]
+        enc -> mat -> pool -> norm
+    }
+
+    subgraph cluster_classify {
+        label="Classification  (CPU — instant)" fontcolor="#e0e0e0" color="#553333" style=dashed
+        dot  [label="W · v̂\n69 dot products\n(weight matrix W: 69 × 1024)"
+              fillcolor="#3a1a1a" fontcolor="#ffaaaa"]
+        smx  [label="softmax(scores)\n→ probability distribution\nΣ pᵢ = 1.0"
+              fillcolor="#4a1a00" fontcolor="#ffcc88"]
+        out  [label="Top-3 predictions:\nstrategy  88%\nC2         7%\nSpec_ops   5%"
+              fillcolor="#1a4a1a" fontcolor="#88ff88" shape=note]
+        dot -> smx -> out
+    }
+
+    doc -> ext -> chk -> enc
+    norm -> dot
+
+    // Annotation: W comes from training
+    W [label="W  (69 × 1024)\nlearned at train time\nstored in militia.joblib"
+       fillcolor="#2a2a44" fontcolor="#aaaaff" shape=cylinder]
+    W -> dot [label="loaded once" style=dashed color="#4477ff" fontcolor="#4477ff"]
+}

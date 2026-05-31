@@ -1,0 +1,76 @@
+digraph Arch3_GPU_Model_Stack {
+    graph [
+        label="GPU 0 Model Stack — RTX 5080 (Blackwell sm_120, 16 GB)"
+        labelloc=t
+        fontname="Helvetica" fontsize=16
+        bgcolor="#1a1a2e" fontcolor="#e0e0e0"
+        rankdir=TB splines=polyline
+        pad=0.6 nodesep=0.5 ranksep=0.8
+    ]
+    node [fontname="Helvetica" fontsize=11 style=filled shape=box]
+    edge [fontname="Helvetica" fontsize=10 color="#aaaaaa" fontcolor="#cccccc"]
+
+    subgraph cluster_hw {
+        label="Hardware — NVIDIA RTX 5080" fontcolor="#e0e0e0" fontsize=13
+        color="#553355" style=dashed
+
+        gpu [label="RTX 5080\nBlackwell / sm_120\n16 GB GDDR7\nCUDA 13.0 (cu130 nightly)"
+             fillcolor="#3a1a4a" fontcolor="white" shape=box3d]
+        vram [label="VRAM Budget\ntotal: 16,303 MiB\nused: ~9,400 MiB\nfree: ~6,900 MiB"
+              fillcolor="#2a1a3a" fontcolor="white" shape=note]
+        gpu -> vram [style=invis]
+    }
+
+    subgraph cluster_cuda {
+        label="CUDA Runtime" fontcolor="#e0e0e0" fontsize=12
+        color="#444477" style=filled fillcolor="#111128"
+
+        torch [label="PyTorch 2.13.0.dev+cu130\nBlackwell sm_120 kernels"
+               fillcolor="#222255" fontcolor="white"]
+        ctx   [label="CUDA context\nCUDA_VISIBLE_DEVICES=0"
+               fillcolor="#1a1a44" fontcolor="white"]
+        torch -> ctx [style=invis]
+    }
+
+    subgraph cluster_models {
+        label="Models in VRAM" fontcolor="#e0e0e0" fontsize=12
+        color="#224466" style=filled fillcolor="#101520"
+
+        bge [label="BAAI/bge-m3\nSentenceTransformer\n~2,200 MiB\n8192-token context\nnormalize_embeddings=True"
+             fillcolor="#1a2a55" fontcolor="white"]
+        easyocr_m [label="EasyOCR (en)\n~200 MiB\nCRAFT text detector\n+ CRNN recognizer"
+                   fillcolor="#1a3055" fontcolor="white"]
+        bge -> easyocr_m [style=invis]
+    }
+
+    subgraph cluster_ops {
+        label="GPU Operations" fontcolor="#e0e0e0" fontsize=12
+        color="#225544" style=dashed
+
+        encode_op [label="encoder.encode(chunks)\nbatch_size=32\nreturns float32 ndarray\n1024-dim per chunk"
+                   fillcolor="#1a3a2a" fontcolor="white"]
+        ocr_op    [label="ocr_reader.readtext(img)\nPyMuPDF 2x render →\nnumpy uint8 array → GPU\nreturns text strings"
+                   fillcolor="#1a2a3a" fontcolor="white"]
+        meanpool  [label="CPU: mean-pool chunk vecs\nper document\n→ 1024-dim doc vector"
+                   fillcolor="#2a3a2a" fontcolor="white"]
+
+        encode_op -> meanpool
+    }
+
+    subgraph cluster_pipeline {
+        label="Per-Class Interleave" fontcolor="#e0e0e0" fontsize=12
+        color="#444433" style=dashed
+
+        seq [label="for each class:\n1. CPU workers extract text\n2. GPU OCR image files\n3. GPU embed all class docs\n→ accumulate embeddings"
+             fillcolor="#3a3a22" fontcolor="white" shape=note]
+    }
+
+    gpu -> torch
+    torch -> bge [label="~2.2 GB"]
+    torch -> easyocr_m [label="~200 MB"]
+    bge -> encode_op [label="inference"]
+    easyocr_m -> ocr_op [label="inference"]
+    encode_op -> meanpool
+    ocr_op -> encode_op [label="text → chunks"]
+    seq -> encode_op [style=invis]
+}

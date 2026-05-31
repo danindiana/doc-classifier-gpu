@@ -1,0 +1,70 @@
+digraph Dot5_Train_vs_Infer {
+    graph [
+        label="Training vs Inference: Two Uses of the Same Embedding Space"
+        labelloc=t fontname="Helvetica" fontsize=16
+        bgcolor="#1a1a2e" fontcolor="#e0e0e0"
+        rankdir=TB pad=0.6 nodesep=0.6 ranksep=0.85
+    ]
+    node [fontname="Helvetica" fontsize=11 style=filled shape=box]
+    edge [fontname="Helvetica" fontsize=10 color="#aaaaaa" fontcolor="#cccccc"]
+
+    // ── TRAINING (left column) ───────────────────────────────────────────────
+    subgraph cluster_train {
+        label="TRAINING  (run once)" fontcolor="#76b900" fontsize=14
+        color="#335500" style=filled fillcolor="#0a1400"
+
+        tc [label="Labelled corpus\n69 sub-folders = 69 classes\n~1887 docs"
+            fillcolor="#1a3a00" fontcolor="#76b900" shape=cylinder]
+        te [label="extract_text()  +  chunk_text()\nfor every document"
+            fillcolor="#1a2a00" fontcolor="#aae0aa"]
+        tg [label="bge-m3.encode()  on GPU\nbatch_size=32, normalize=True"
+            fillcolor="#2a3a00" fontcolor="#76b900"]
+        tx [label="X  matrix\nshape: (N_docs × 1024)\nN_docs ≈ 1000+"
+            fillcolor="#1a3a00" fontcolor="#ccff88"]
+        ty [label="y  labels\nshape: (N_docs,)\n['strategy', 'medical', ...]"
+            fillcolor="#1a3a00" fontcolor="#ccff88"]
+        tf [label="LogisticRegression\n.fit(X, y)\nC=10.0, class_weight=balanced"
+            fillcolor="#2a4a00" fontcolor="#88ff44"]
+        tc -> te -> tg -> tx
+        tc -> ty
+        tx -> tf
+        ty -> tf
+    }
+
+    // ── WEIGHT MATRIX (bridge) ───────────────────────────────────────────────
+    W [label="W  — Weight Matrix\nshape: (69 × 1024)\none 1024-dim direction\nper class\n\nStored in militia.joblib"
+       fillcolor="#2a2a5a" fontcolor="#aaaaff" shape=cylinder]
+
+    // ── INFERENCE (right column) ─────────────────────────────────────────────
+    subgraph cluster_infer {
+        label="INFERENCE  (run per document)" fontcolor="#4477ff" fontsize=14
+        color="#223366" style=filled fillcolor="#000a1a"
+
+        ic [label="New unlabelled document\n(any supported format)"
+            fillcolor="#0a1a3a" fontcolor="#4477ff" shape=note]
+        ie [label="extract_text()  +  chunk_text()\nsame pipeline as training"
+            fillcolor="#0a1a3a" fontcolor="#6699ff"]
+        ig [label="bge-m3.encode()  on GPU\nsame model, same normalize=True"
+            fillcolor="#0a2a4a" fontcolor="#4477ff"]
+        iv [label="v̂  — unit vector\nshape: (1024,)\npoint on S¹⁰²³"
+            fillcolor="#0a1a3a" fontcolor="#88aaff"]
+        id [label="W · v̂\n69 dot products\n= cosine similarity to each class"
+            fillcolor="#1a1a4a" fontcolor="#aaaaff"]
+        is [label="softmax(scores)\n→ probabilities"
+            fillcolor="#0a2a4a" fontcolor="#6699ff"]
+        io [label="strategy  88%\nC2         7%\nSpec_ops   5%"
+            fillcolor="#0a3a1a" fontcolor="#88ff88" shape=note]
+        ic -> ie -> ig -> iv -> id -> is -> io
+    }
+
+    // ── Connections ──────────────────────────────────────────────────────────
+    tf -> W [label="produces" color="#76b900" fontcolor="#76b900" penwidth=2]
+    W  -> id [label="loaded at\npredict time" color="#4477ff" fontcolor="#4477ff"
+              style=dashed penwidth=2]
+
+    // ── Key insight ──────────────────────────────────────────────────────────
+    insight [label="Key insight:\nBoth training and inference embed documents into\nthe SAME hypersphere using the SAME bge-m3 model.\nTraining learns WHERE classes live on the sphere.\nInference finds WHERE a new doc lands, then\nasks: which class region is it in?"
+             fillcolor="#1a1a3a" fontcolor="#ccccff" shape=note
+             fontsize=10]
+    W -> insight [style=invis]
+}

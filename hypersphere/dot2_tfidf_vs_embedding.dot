@@ -1,0 +1,62 @@
+digraph Dot2_TfIdf_vs_Embedding {
+    graph [
+        label="TF-IDF Space vs Embedding Space"
+        labelloc=t fontname="Helvetica" fontsize=16
+        bgcolor="#1a1a2e" fontcolor="#e0e0e0"
+        rankdir=TB pad=0.6 nodesep=0.5 ranksep=0.9
+    ]
+    node [fontname="Helvetica" fontsize=11 style=filled shape=box]
+    edge [fontname="Helvetica" fontsize=10 color="#aaaaaa" fontcolor="#cccccc"]
+
+    subgraph cluster_tfidf {
+        label="TF-IDF Vector Space" fontcolor="#cc8844" fontsize=14
+        color="#553322" style=filled fillcolor="#1a0e00"
+
+        td [label="~100,000 dimensions\n(one per vocabulary word)"
+            fillcolor="#3a2200" fontcolor="#ffaa44"]
+        ts [label="Sparse vectors\n(mostly zeros)" fillcolor="#2a1a00" fontcolor="#cc8844"]
+        tv [label="Vocabulary-dependent\n'attack' ≠ 'assault'\n(different words = far apart)"
+            fillcolor="#2a1a00" fontcolor="#cc8844"]
+        tm [label="Distance metric:\nEuclidean or cosine\n(no meaningful geometry)"
+            fillcolor="#2a1a00" fontcolor="#cc8844"]
+        tl [label="Same topic, different vocab\n→ distant in space"
+            fillcolor="#5a1a00" fontcolor="#ffaa44"]
+        td -> ts -> tv -> tm -> tl [style=invis]
+    }
+
+    subgraph cluster_embed {
+        label="Embedding Space  (bge-m3)" fontcolor="#44cc44" fontsize=14
+        color="#224422" style=filled fillcolor="#001a00"
+
+        ed [label="1024 dimensions\n(dense, fixed)"
+            fillcolor="#1a3a1a" fontcolor="#88ff88"]
+        es [label="Dense vectors\n(all dims carry signal)"
+            fillcolor="#0a2a0a" fontcolor="#66cc66"]
+        ev [label="Vocabulary-independent\n'attack' ≈ 'assault'\n(same meaning = nearby)"
+            fillcolor="#0a2a0a" fontcolor="#66cc66"]
+        em [label="Distance metric:\ncosine similarity\non unit hypersphere S¹⁰²³"
+            fillcolor="#0a2a0a" fontcolor="#66cc66"]
+        el [label="Same topic, different vocab\n→ close on the sphere"
+            fillcolor="#0a4a0a" fontcolor="#88ff88"]
+        ed -> es -> ev -> em -> el [style=invis]
+    }
+
+    subgraph cluster_compare {
+        label="Comparison" fontcolor="#e0e0e0" color="#444466" style=dashed
+        c1 [label="Dimensionality" fillcolor="#2a2a4a" fontcolor="#ccccff"]
+        c2 [label="Sparsity" fillcolor="#2a2a4a" fontcolor="#ccccff"]
+        c3 [label="Semantic aware?" fillcolor="#2a2a4a" fontcolor="#ccccff"]
+        c4 [label="Cross-language?" fillcolor="#2a2a4a" fontcolor="#ccccff"]
+        c5 [label="Geometry" fillcolor="#2a2a4a" fontcolor="#ccccff"]
+        c1 -> c2 -> c3 -> c4 -> c5 [style=invis]
+    }
+
+    c1 -> td [label="~100k" color="#cc8844" fontcolor="#cc8844"]
+    c1 -> ed [label="1024" color="#44cc44" fontcolor="#44cc44"]
+    c2 -> ts [label="sparse" color="#cc8844" fontcolor="#cc8844"]
+    c2 -> es [label="dense" color="#44cc44" fontcolor="#44cc44"]
+    c3 -> tv [label="no" color="#cc8844" fontcolor="#cc8844"]
+    c3 -> ev [label="yes" color="#44cc44" fontcolor="#44cc44"]
+    c4 -> tm [label="no" color="#cc8844" fontcolor="#cc8844"]
+    c4 -> em [label="yes (bge-m3)" color="#44cc44" fontcolor="#44cc44"]
+}
