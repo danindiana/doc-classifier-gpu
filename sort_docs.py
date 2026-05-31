@@ -26,6 +26,7 @@ Output:
 import argparse
 import csv
 import os
+import queue
 import shutil
 import signal
 import sys
@@ -148,6 +149,18 @@ def load_encoders(model_name: str, single_gpu: bool = False,
     return encoders
 
 
+def _embedding_worker(q, encoders, clf, classes, chunk_chars,
+                      encode_batch, threshold, all_results, progress, task_emb):
+    """Background thread: dequeue batches and embed them while extraction continues."""
+    while True:
+        batch = q.get()
+        if batch is None:      # sentinel — extraction finished
+            break
+        _flush_batch(batch, encoders, clf, classes, chunk_chars,
+                     encode_batch, threshold, all_results, progress, task_emb)
+        q.task_done()
+
+
 def safe_dest(dst_dir: Path, src: Path) -> Path:
     dst = dst_dir / src.name
     if not dst.exists():
@@ -260,17 +273,17 @@ def main():
     )
     console.print(f"  Found [green]{len(all_files):,}[/] files\n")
 
-    # ── Persistent Pool + streaming embed: workers run continuously ───────────
-    # One pool for all files; embed every --batch extracted texts immediately.
-    # CPU workers and GPU encoder both active simultaneously — no idle gaps.
+    # ── True pipeline: extraction loop never blocks, embedding runs in background ─
+    # Main thread drains imap_unordered pipe continuously (workers never stall).
+    # Background thread dequeues batches and embeds them on GPU simultaneously.
     all_results   = []
     no_text_files = []
-    pending_texts = {}   # Path → text, accumulating toward next embed batch
+    pending_texts = {}
     t0_total = time.time()
 
     console.print(
         f"[bold]Streaming {len(all_files):,} files "
-        f"({args.workers} workers · embed every {args.batch}) ...[/]\n")
+        f"({args.workers} workers · embed every {args.batch} · background thread)[/]\n")
 
     with _make_progress() as progress:
         task_extract = progress.add_task(
@@ -280,11 +293,21 @@ def main():
             f"[blue]GPU embed[/] (encode-batch={args.encode_batch})",
             total=len(all_files))
 
+        embed_q = queue.Queue()   # unbounded — batches live in RAM until embedded
+        embed_thread = threading.Thread(
+            target=_embedding_worker,
+            args=(embed_q, encoders, clf, classes, chunk_chars,
+                  args.encode_batch, args.threshold, all_results,
+                  progress, task_embed),
+            daemon=True,
+        )
+        embed_thread.start()
+
         with Pool(processes=args.workers, maxtasksperchild=args.maxtasks) as pool:
             try:
                 result_iter = pool.imap_unordered(
                     _extract_cpu, [str(f) for f in all_files], chunksize=1)
-                for path_str, text in result_iter:
+                for path_str, text in result_iter:  # tight loop — pipe always drained
                     if _shutdown.is_set():
                         pool.terminate()
                         break
@@ -294,23 +317,18 @@ def main():
                         pending_texts[f] = text
                     else:
                         no_text_files.append(f)
-
-                    # GPU embeds whenever a full batch is ready
-                    # Workers keep running during this call — true overlap
+                    # Hand batch to embed thread; never blocks on GPU
                     if len(pending_texts) >= args.batch:
-                        _flush_batch(pending_texts, encoders, clf, classes,
-                                     chunk_chars, args.encode_batch,
-                                     args.threshold, all_results,
-                                     progress, task_embed)
+                        embed_q.put(dict(pending_texts))
                         pending_texts = {}
             except Exception as exc:
                 console.print(f"  [yellow]⚠ Pool error: {exc}[/]")
 
-        # Final partial batch (remaining texts after last full flush)
+        # Final partial batch + sentinel to shut down embed thread
         if pending_texts:
-            _flush_batch(pending_texts, encoders, clf, classes,
-                         chunk_chars, args.encode_batch,
-                         args.threshold, all_results, progress, task_embed)
+            embed_q.put(dict(pending_texts))
+        embed_q.put(None)
+        embed_thread.join()   # wait for all GPU embedding to complete
 
     elapsed = time.time() - t0_total
     total_extracted = len(all_results)
