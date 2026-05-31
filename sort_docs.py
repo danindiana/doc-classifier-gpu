@@ -27,7 +27,9 @@ import argparse
 import csv
 import os
 import shutil
+import signal
 import sys
+import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -39,6 +41,23 @@ import numpy as np
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
+
+# ── Graceful shutdown ──────────────────────────────────────────────────────────
+_shutdown = threading.Event()
+
+def _handle_signal(signum, frame):
+    if not _shutdown.is_set():
+        try:
+            from doc_classifier_gpu import console
+            console.print(
+                "\n  [yellow]⚠ Ctrl-C — finishing current window then saving "
+                "partial results (Ctrl-C again to force quit)[/]")
+        except Exception:
+            print("\n  ⚠ Shutdown requested — saving partial results...")
+    _shutdown.set()
+
+signal.signal(signal.SIGINT,  _handle_signal)
+signal.signal(signal.SIGTERM, _handle_signal)
 
 from doc_classifier_gpu import (
     _extract_cpu,
@@ -232,7 +251,8 @@ def main():
         f"  workers      [green]{args.workers}[/]  "
         f"maxtasks [green]{args.maxtasks}[/]  "
         f"batch [green]{args.batch}[/]  "
-        f"encode-batch [green]{args.encode_batch}[/]",
+        f"encode-batch [green]{args.encode_batch}[/]\n"
+        f"  [dim]Ctrl-C → graceful shutdown (finishes current window, saves partial CSV)[/]",
         style="green", padding=(0, 2),
     ))
 
@@ -275,6 +295,12 @@ def main():
             total=n_windows)
 
         for w in range(n_windows):
+            if _shutdown.is_set():
+                console.print(
+                    f"  [yellow]Stopping at window {w+1}/{n_windows} — "
+                    f"{len(all_results):,} docs classified so far[/]")
+                break
+
             window = all_files[w * args.batch:(w + 1) * args.batch]
 
             # Extract this window
@@ -304,6 +330,13 @@ def main():
 
     elapsed = time.time() - t0_total
     total_extracted = len(all_results)
+    if _shutdown.is_set():
+        console.print(Panel(
+            f"[yellow]Partial run — {total_extracted:,} docs classified "
+            f"({100*total_extracted/len(all_files):.0f}% of {len(all_files):,}).\n"
+            f"Results saved to CSV. Rerun without interruption for full results.[/]",
+            border_style="yellow",
+        ))
     console.print(
         f"\n  [green]{total_extracted:,}[/] docs embedded in "
         f"[cyan]{elapsed/60:.1f} min[/]  "
