@@ -1,0 +1,100 @@
+digraph Concurrency3_Memory_At_Fork {
+    graph [
+        label="What fork() Inherits: Memory, Threads, File Descriptors, Lock States"
+        labelloc=t
+        fontname="Helvetica" fontsize=14
+        bgcolor="#1a1a2e" fontcolor="#e0e0e0"
+        rankdir=LR splines=ortho
+        pad=0.7 nodesep=0.5 ranksep=2.0
+    ]
+    node [fontname="Helvetica" fontsize=10 style=filled shape=box]
+    edge [fontname="Helvetica" fontsize=9 color="#aaaaaa" fontcolor="#cccccc"]
+
+    subgraph cluster_parent {
+        label="Parent Process" fontcolor="#88cc88" fontsize=13
+        color="#334433" style=filled fillcolor="#0e1a0e"
+
+        subgraph cluster_p_threads {
+            label="Thread Table" fontcolor="#cccccc" fontsize=10
+            color="#445544" style=dashed
+            p_t1 [label="tid=1  main thread\nstate: running" fillcolor="#2a4a2a" fontcolor="white"]
+            p_t2 [label="tid=2  feeder thread\nstate: running\nholds Mutex M" fillcolor="#3a5a2a" fontcolor="white"]
+        }
+
+        subgraph cluster_p_mem {
+            label="Virtual Memory" fontcolor="#cccccc" fontsize=10
+            color="#445544" style=dashed
+            p_heap  [label="heap\n(Python objects, buffers)" fillcolor="#2a2a4a" fontcolor="white"]
+            p_code  [label="code segment\n(read-only, shared)" fillcolor="#2a3a4a" fontcolor="white"]
+            p_s1    [label="stack tid=1" fillcolor="#2a3a4a" fontcolor="white"]
+            p_s2    [label="stack tid=2" fillcolor="#2a3a4a" fontcolor="white"]
+            p_mutex [label="Mutex M  (in heap)\nfutex word = 1  (LOCKED)\nno explicit owner field\n[PTHREAD_MUTEX_DEFAULT]"
+                     fillcolor="#6a3300" fontcolor="white" shape=hexagon]
+        }
+
+        subgraph cluster_p_fds {
+            label="File Descriptor Table" fontcolor="#cccccc" fontsize=10
+            color="#445544" style=dashed
+            p_fd0 [label="fd 0 → stdin (kernel obj)"  fillcolor="#2a2a3a" fontcolor="white"]
+            p_fd1 [label="fd 1 → stdout"              fillcolor="#2a2a3a" fontcolor="white"]
+            p_fd2 [label="fd 2 → stderr"              fillcolor="#2a2a3a" fontcolor="white"]
+            p_fd3 [label="fd 3 → pipe_write"          fillcolor="#2a3a4a" fontcolor="white"]
+            p_fd4 [label="fd 4 → socket (Manager)"   fillcolor="#2a3a4a" fontcolor="white"]
+        }
+
+        p_t2 -> p_mutex [label="holds" color="#ff8800" fontcolor="#ff8800"]
+        p_t2 -> p_s2
+        p_t1 -> p_s1
+    }
+
+    subgraph cluster_fork_legend {
+        label="fork() semantics" fontcolor="#cccccc" fontsize=11
+        color="#445544" style=dashed fillcolor="#111122"
+        fl1 [label="✓ COPIED (COW):  virtual memory\n    heap, stacks, mutex state" fillcolor="#1a3a1a" fontcolor="#88ee88" shape=box]
+        fl2 [label="✓ DUPLICATED:  fd table\n    same fd numbers, same kernel objects" fillcolor="#1a2a3a" fontcolor="#88aaee" shape=box]
+        fl3 [label="✗ NOT COPIED:  threads\n    only the calling thread survives" fillcolor="#3a1a1a" fontcolor="#ee8888" shape=box]
+        fl4 [label="⚠ INHERITED STATE:  mutex lock bits\n    word=1 in child, but owning thread gone" fillcolor="#3a2200" fontcolor="#ffaa44" shape=box]
+    }
+
+    subgraph cluster_child {
+        label="Child Process (immediately after fork)" fontcolor="#cc8888" fontsize=13
+        color="#4a1a1a" style=filled fillcolor="#1a0e0e"
+
+        subgraph cluster_c_threads {
+            label="Thread Table  — ONLY calling thread" fontcolor="#ff8866" fontsize=10
+            color="#663333" style=dashed
+            c_t1     [label="tid=1  main thread\nstate: just returned\nfrom fork()" fillcolor="#3a2a2a" fontcolor="white"]
+            c_t2_gone [label="tid=2  ABSENT\n(threads are NOT\ncopied by fork)"
+                       fillcolor="#2a1515" fontcolor="#888888" style=dashed color="#663333"]
+        }
+
+        subgraph cluster_c_mem {
+            label="Virtual Memory  — COW copy of parent" fontcolor="#ff8866" fontsize=10
+            color="#663333" style=dashed
+            c_heap  [label="heap  (COW — shared pages until write)" fillcolor="#2a1a2a" fontcolor="#aaaaaa"]
+            c_code  [label="code segment  (shared, read-only)"      fillcolor="#2a1a2a" fontcolor="#aaaaaa"]
+            c_s1    [label="stack tid=1  (private copy)"            fillcolor="#2a2a3a" fontcolor="white"]
+            c_s2_gone [label="stack tid=2  ABSENT"                  fillcolor="#1a1010" fontcolor="#666666" style=dashed]
+            c_mutex [label="Mutex M  (INHERITED COPY)\nfutex word = 1  ← STILL LOCKED\n\nNo thread holds it.\nNo thread CAN release it.\nAny acquire() → futex(WAIT)\n→ DEADLOCK"
+                     fillcolor="#880000" fontcolor="#ffcccc" shape=hexagon penwidth=2]
+        }
+
+        subgraph cluster_c_fds {
+            label="File Descriptor Table  — DUPLICATED (fork-safe)" fontcolor="#88cc88" fontsize=10
+            color="#334433" style=dashed
+            c_fd0 [label="fd 0 → stdin  (same kernel obj)" fillcolor="#1a2a1a" fontcolor="white"]
+            c_fd1 [label="fd 1 → stdout"                  fillcolor="#1a2a1a" fontcolor="white"]
+            c_fd2 [label="fd 2 → stderr"                  fillcolor="#1a2a1a" fontcolor="white"]
+            c_fd3 [label="fd 3 → pipe_write  (safe)"      fillcolor="#1a3a2a" fontcolor="white"]
+            c_fd4 [label="fd 4 → socket (Manager)  ✓"    fillcolor="#1a3a2a" fontcolor="#88ee88"]
+        }
+
+        c_t1 -> c_mutex [label="any pool operation\n→ tries acquire(M)\n→ DEADLOCK" color="#ff4444" fontcolor="#ff6666" style=bold]
+    }
+
+    p_heap  -> c_heap   [label="COW copy"   color="#888844" style=dashed]
+    p_mutex -> c_mutex  [label="COPIED\n(word=1 preserved)" color="#ff8800" fontcolor="#ffaa44" style=bold]
+    p_fd4   -> c_fd4    [label="duplicated fd\n(fork-safe)" color="#44aa44"]
+    p_t1    -> c_t1     [label="survives fork" color="#44aa44"]
+    p_t2    -> c_t2_gone [label="LOST at fork" color="#ff4444" style=dashed]
+}

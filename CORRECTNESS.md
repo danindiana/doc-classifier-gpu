@@ -132,23 +132,34 @@ would happen without it, and which correctness layer it protects.
 
 ### CPU extraction layer
 
-#### PyMuPDF (fitz), not pdfplumber
+#### PyMuPDF (fitz) vs pdfplumber — reducing a known crash path
 
-**Prevents:** SIGSEGV from Pillow C extensions in parallel workers.
+> **Open question:** The behaviour of both pdfplumber and PyMuPDF on malformed, corrupt,
+> or adversarially crafted PDFs is not fully characterised. Both have C extension code
+> (libmupdf, Pillow's `_imaging.so`) capable of SIGSEGV or SIGABRT on bad input. This
+> pipeline treats PDF extraction as **inherently unreliable** regardless of library
+> choice. Crash isolation (`maxtasksperchild`, restart loop) is the primary correctness
+> property. Library selection is a secondary, probabilistic improvement.
 
-**The problem without it:** `pdfplumber.page.extract_text()` calls
+**Reduces:** SIGSEGV frequency from a specific Pillow code path in parallel workers.
+
+**The observed problem with pdfplumber:** `pdfplumber.page.extract_text()` calls
 `pdfminer.image.PDFImageInterpreter` → `PIL.Image.open()` → `_imaging.so` (Pillow C
-extension) for every PDF that has embedded images. A corrupt image byte sequence
-triggers a segfault inside the C code. The worker process is killed by SIGSEGV. 98%
-of the Liberated_manuals class (697 PDFs) have embedded images; with 14 workers, the
-class is processing almost entirely sequentially due to constant segfaults.
+extension) for every PDF that contains embedded images. A corrupt image byte sequence
+can trigger a segfault inside the C code. The worker process is killed by SIGSEGV.
+98% of the Liberated_manuals class (697 PDFs) have embedded images; with 14 workers,
+the class was processing almost entirely sequentially due to frequent crashes.
 
-**The fix:** `fitz.page.get_text()` handles embedded images internally via MuPDF's own
-C layer. Pillow is never invoked. Smoke test confirmed: a 312-page, 68 MB PDF with
-hundreds of embedded images extracted 720,000 chars in 0.31 seconds with no crash.
+**The change:** `fitz.page.get_text()` routes image handling through MuPDF's own C
+layer rather than Pillow's. This eliminates the specific crash path we observed
+(pdfminer → PIL.Image.open() → `_imaging.so` → SIGSEGV on corrupt image data).
+PyMuPDF has its own C extensions and libmupdf can also crash on sufficiently malformed
+PDFs — both libraries are brittle on untrusted input. The difference is that
+PyMuPDF's crash frequency was lower in practice on this corpus; the primary defence
+remains crash isolation, not library choice.
 
-**Layer protected:** 2 (operational stability), 3 (data completeness — segfaults
-cause some files to be silently skipped).
+**Layer protected:** 2 (operational stability), 3 (data completeness — without crash
+isolation, segfaults cause files to be silently skipped).
 
 ---
 
@@ -386,6 +397,166 @@ losing exactly the signal that distinguishes classes. bge-m3 understands that
 "tactical intelligence assessment" and "strategic intelligence overview" are different
 concepts even though they share "intelligence." The embedding space reflects the
 difference.
+
+---
+
+## §4a — Fork safety, mutex inheritance, and IPC topology
+
+This section explains the kernel-level mechanisms behind bugs #15 (spawn+fork deadlock)
+and the design of the Manager Queue fix. The diagrams referenced here are in `diagrams/`.
+
+| Diagram | What it shows |
+|---------|--------------|
+| [`concurrency1_fork_feeder_deadlock.png`](diagrams/concurrency1_fork_feeder_deadlock.png) | Temporal sequence: feeder thread holds mutex → fork → child deadlocks |
+| [`concurrency2_mutex_states.png`](diagrams/concurrency2_mutex_states.png) | Futex state machine including the ORPHANED state |
+| [`concurrency3_memory_at_fork.png`](diagrams/concurrency3_memory_at_fork.png) | What fork() inherits: memory, threads, fds, lock states |
+| [`concurrency4_queue_type_comparison.png`](diagrams/concurrency4_queue_type_comparison.png) | ctx.Queue() (broken) vs Manager().Queue() (fixed) side by side |
+| [`concurrency5_ipc_topology.png`](diagrams/concurrency5_ipc_topology.png) | Full production IPC topology of sort_docs.py |
+
+---
+
+### What `fork()` actually copies
+
+`fork()` creates a child process with a copy-on-write clone of the parent's virtual
+address space. The kernel duplicates the page table entries; physical pages are shared
+until either process writes to them (copy-on-write).
+
+**Inherited by the child:**
+
+| Resource | Mechanism | Fork-safe? |
+|----------|-----------|-----------|
+| Virtual memory (heap, code, stacks) | COW copy | Mostly yes — data is private |
+| File descriptor table | Duplicated — same kernel objects | **Yes** — independent seek pointers, safe reads/writes |
+| Signal handlers | Copied | Yes |
+| Open file descriptions (sockets, pipes) | Shared kernel objects behind duplicated fds | Yes for independent access |
+| Mutex/lock state embedded in memory | COW copy of the futex word values | **Dangerous** — see below |
+
+**NOT inherited:**
+
+| Resource | Note |
+|----------|------|
+| Threads | Only the calling thread survives in the child |
+| Pending signals | Cleared in child |
+| Thread-local storage of non-surviving threads | Gone |
+
+**The dangerous case:** Any mutex that was *held* by a thread at the moment of `fork()`
+survives in the child's memory with its word still set to "locked." The thread that
+held it does not exist in the child. That mutex is permanently locked. This is called
+an **orphaned mutex**. (See `diagrams/concurrency3_memory_at_fork.png`.)
+
+---
+
+### Mutexes, futexes, and lock states
+
+Python's `threading.Lock` is implemented on Linux using **futexes** (fast userspace
+mutexes). A futex is a 32-bit integer in the process's address space, with
+kernel-assisted waiting for contention:
+
+```
+futex word = 0   →  UNLOCKED
+futex word = 1   →  LOCKED, no waiters
+futex word = 2   →  LOCKED, waiters are sleeping in kernel
+```
+
+**Acquiring a lock (uncontended):** atomic CAS `0 → 1`. If the word was 0, acquisition
+succeeds immediately without any syscall. This is the "fast path" — pure userspace.
+
+**Acquiring a lock (contended):** if the word is already 1, the thread sets it to 2
+(signals that there are now waiters) and calls `futex(FUTEX_WAIT, addr, 2)` to sleep
+in the kernel. The kernel adds the thread to a wait queue for that memory address.
+
+**Releasing a lock:** write 0 to the word. If the previous value was 2 (there were
+waiters), call `futex(FUTEX_WAKE, addr, 1)` to wake one sleeping thread. That thread
+then does CAS `0 → 1` and continues.
+
+**The ORPHANED state** (see `diagrams/concurrency2_mutex_states.png`): after `fork()`,
+a child may inherit a futex word of 1 or 2 (locked), but no thread owns it. The word
+will never be written to 0 because no thread will release it. Any `futex(FUTEX_WAIT)`
+call in the child for that address will wait forever. This is precisely what
+`ps wchan = futex_` means: the process is blocked in the kernel waiting for a futex
+word that will never change.
+
+**Why there is no owning thread ID:** `PTHREAD_MUTEX_DEFAULT` (which Python uses) does
+not store the owner thread ID in the futex word. There is no mechanism for the kernel
+to detect that a mutex is orphaned at runtime. It simply waits. Indefinitely.
+
+---
+
+### Why Python's `multiprocessing.Queue` is not fork-safe
+
+`mp.get_context('spawn').Queue()` (and the default `multiprocessing.Queue`) uses a
+**feeder thread** in the creating process. When you call `queue.put(obj)`:
+
+1. The object is pickled and appended to an internal deque (fast, no lock contention)
+2. A background feeder thread wakes up, acquires a `threading.Lock` (the "write lock"),
+   and writes the serialised bytes to the underlying `Pipe`
+3. The feeder thread releases the write lock
+
+The write lock is a `threading.Lock` — backed by a futex in the process's memory.
+
+If `Pool()` forks worker processes **while the feeder thread holds the write lock**
+(step 2), the child processes inherit a futex word of 1 (locked). The feeder thread
+does not exist in the children. Any internal operation that tries to acquire the write
+lock — even indirectly, through Pool's own result queue — will call `futex(FUTEX_WAIT)`
+and block forever.
+
+This is a **probabilistic** deadlock: it happens only if the fork occurs at the exact
+moment the feeder thread holds the lock. With high-throughput batching, this moment is
+frequent enough to be essentially guaranteed over a long run. The 9h37m observed
+deadlock is consistent with the lock being held at exactly the time of the first
+`Pool()` creation after `put()` was first called on the spawn Queue.
+
+(See `diagrams/concurrency1_fork_feeder_deadlock.png` and
+`diagrams/concurrency4_queue_type_comparison.png`.)
+
+---
+
+### File descriptors across `fork()`
+
+File descriptors are handles into the kernel's file description table. The fd number
+is an index into the process's per-process fd table. On `fork()`:
+
+- The per-process fd table is **duplicated**: the child gets its own fd numbers (0, 1, 2, 3, ...)
+- Both parent and child fd numbers point to the **same kernel file descriptions**
+- Operations on shared file descriptions (read, write, seek) are independent in
+  concurrent access — the kernel handles this correctly for most file types
+- Sockets: both parent and child can read/write the socket independently; for a Manager
+  proxy object, the child reads from the socket to communicate with the Manager server
+
+This is why `Manager().Queue()` is fork-safe for this use case: the child inherits the
+socket fd, uses it to send/receive data to/from the Manager server, and no mutex in the
+main process is involved. See `diagrams/concurrency4_queue_type_comparison.png` (right
+panel) for the complete flow.
+
+**Caveat:** if both parent and child write to the same pipe end without coordination,
+their writes can interleave. For extraction workers, this is handled by Pool's internal
+protocol — each worker writes to its own dedicated result pipe back to the pool manager
+thread.
+
+---
+
+### What the extraction Pool workers actually inherit in sort_docs.py
+
+| Resource | Inherited? | Safe? | Notes |
+|----------|-----------|-------|-------|
+| Main process heap | COW copy | Mostly | Mutex state is the danger |
+| Manager proxy socket fd | Duplicated | **Yes** | Workers can send/receive to Manager server |
+| Pool result pipe fds | Duplicated | **Yes** | Pool manages these; each worker gets its own |
+| bge-m3 model weights | NOT present | N/A | Workers don't use the encoder |
+| `in_qs`, `out_qs` proxy objects | Copied (COW) | **Yes** | Proxy holds socket fd, no mutexes |
+| Feeder thread mutexes (old design) | Word=1 in COW copy | **NO — deadlock** | Fixed by Manager queues |
+| Signal handlers (SIGINT/SIGTERM) | Copied | Yes | Workers inherit graceful shutdown handlers |
+| `_shutdown` threading.Event | COW copy | Partially | Workers have their own copy; main sets it via Pool protocol |
+
+The extraction workers only need:
+1. The Pool's internal result pipe (to return `(path_str, text)` tuples)
+2. The file descriptors for reading PDFs from the source volume
+3. No GPU, no encoder, no queue proxies
+
+With `Manager().Queue()`, the socket fd is inherited safely. With `ctx.Queue()`, the
+feeder thread mutex was inherited in a locked state — causing the deadlock.
+
+(See `diagrams/concurrency5_ipc_topology.png` for the complete production topology.)
 
 ---
 

@@ -1,0 +1,121 @@
+digraph Concurrency4_Queue_Type_Comparison {
+    graph [
+        label="ctx.Queue() vs Manager().Queue() — IPC Fork Safety Comparison"
+        labelloc=t
+        fontname="Helvetica" fontsize=14
+        bgcolor="#1a1a2e" fontcolor="#e0e0e0"
+        rankdir=TB splines=ortho
+        pad=0.7 nodesep=0.6 ranksep=0.8
+    ]
+    node [fontname="Helvetica" fontsize=10 style=filled shape=box]
+    edge [fontname="Helvetica" fontsize=9 color="#aaaaaa" fontcolor="#cccccc"]
+
+    subgraph cluster_broken {
+        label="BROKEN  —  ctx.Queue()  (what we had before fix)" fontcolor="#ff6666" fontsize=13
+        color="#4a1a1a" style=filled fillcolor="#12080a"
+
+        subgraph cluster_b_main {
+            label="Main Process" fontcolor="#cc8888" fontsize=11
+            color="#662222" style=dashed
+            b_main_t   [label="Main Thread\nextraction loop" fillcolor="#3a2020" fontcolor="white"]
+            b_feeder   [label="Feeder Thread\n(started by ctx.Queue())\nholds Mutex M\nwhile writing to pipe"
+                        fillcolor="#6a2200" fontcolor="white"]
+            b_in_qs    [label="in_qs[0], in_qs[1]\nctx.Queue() objects\n(feeder threads in this process)"
+                        fillcolor="#5a2222" fontcolor="white" shape=cylinder]
+            b_mutex    [label="Mutex M\nword=1 (LOCKED)\nin parent heap"
+                        fillcolor="#881a00" fontcolor="white" shape=hexagon]
+        }
+
+        b_pipe     [label="OS Pipe\n(limited buffer)"
+                    fillcolor="#2a1a1a" fontcolor="#aaaaaa" shape=parallelogram]
+
+        b_fork_pt  [label="Pool() forks workers HERE\n⚠ feeder thread active, may hold Mutex M"
+                    fillcolor="#663300" fontcolor="white" shape=octagon]
+
+        subgraph cluster_b_workers {
+            label="Fork Workers (inherit locked Mutex M)" fontcolor="#ff6666" fontsize=10
+            color="#661111" style=dashed
+            b_w0 [label="Worker 0\nMutex M word=1 (inherited)\nfutex(WAIT) → DEADLOCK"
+                  fillcolor="#880000" fontcolor="#ffcccc"]
+            b_w1 [label="Worker 1\nMutex M word=1 (inherited)\nfutex(WAIT) → DEADLOCK"
+                  fillcolor="#880000" fontcolor="#ffcccc"]
+            b_wn [label="Worker N-1\n..."
+                  fillcolor="#880000" fontcolor="#ffcccc"]
+        }
+
+        b_embed    [label="Embed Subprocess\n(spawn)\nbge-m3 loaded"
+                    fillcolor="#2a2a3a" fontcolor="white"]
+
+        b_deadlock [label="ALL WORKERS DEADLOCKED\nps wchan: futex_\nCPU 0%,  GPU 0%\nno output for 9h37m"
+                    fillcolor="#660000" fontcolor="#ffaaaa" shape=diamond]
+
+        b_main_t -> b_in_qs  [label="put(batch)"]
+        b_feeder  -> b_mutex [label="holds" color="#ff8800" fontcolor="#ff8800"]
+        b_feeder  -> b_pipe  [label="writes (may hold M)"]
+        b_pipe    -> b_embed [label="socket"]
+        b_main_t  -> b_fork_pt [label="creates Pool()"]
+        b_fork_pt -> b_w0 [label="fork()\ncopies M word=1" color="#ff4444"]
+        b_fork_pt -> b_w1 [label="fork()" color="#ff4444"]
+        b_fork_pt -> b_wn [label="fork()" color="#ff4444"]
+        b_w0 -> b_deadlock [color="#ff2222"]
+        b_w1 -> b_deadlock [color="#ff2222"]
+        b_wn -> b_deadlock [color="#ff2222"]
+    }
+
+    subgraph cluster_fixed {
+        label="FIXED  —  Manager().Queue()  (current implementation)" fontcolor="#88ee88" fontsize=13
+        color="#1a4a1a" style=filled fillcolor="#08120a"
+
+        subgraph cluster_f_main {
+            label="Main Process  (no feeder threads for queues)" fontcolor="#88cc88" fontsize=11
+            color="#336633" style=dashed
+            f_main_t  [label="Main Thread\nextraction loop" fillcolor="#1a3a1a" fontcolor="white"]
+            f_coll_t  [label="Collector Thread\ndrains out_qs" fillcolor="#1a3a2a" fontcolor="white"]
+            f_proxies [label="in_qs[0], in_qs[1]\nout_qs[0], out_qs[1]\nProxy objects only\n(hold socket fds, NO mutexes)"
+                       fillcolor="#1a3a3a" fontcolor="white" shape=cylinder]
+            f_no_mutex [label="NO Mutex M\nin main process heap"
+                        fillcolor="#1a2a1a" fontcolor="#88cc88" style="filled,dashed" shape=hexagon]
+        }
+
+        subgraph cluster_f_manager {
+            label="Manager Server Process  (spawned, not forked)" fontcolor="#88aaee" fontsize=11
+            color="#334466" style=dashed
+            f_mgr [label="Queue data: in_q[0], in_q[1]\n                out_q[0], out_q[1]\nManages locks internally\nCommunicates via socket"
+                   fillcolor="#2a2a5a" fontcolor="white" shape=cylinder]
+        }
+
+        f_fork_pt  [label="Pool() forks workers HERE\n✓ no feeder threads active\n✓ main process has no mutex to inherit"
+                    fillcolor="#224422" fontcolor="#88ee88" shape=octagon]
+
+        subgraph cluster_f_workers {
+            label="Fork Workers (inherit socket fd only)" fontcolor="#88cc88" fontsize=10
+            color="#224422" style=dashed
+            f_w0 [label="Worker 0\ninherits socket fd\nProxy.put() → socket → Manager\nNO deadlock"
+                  fillcolor="#1a3a1a" fontcolor="white"]
+            f_w1 [label="Worker 1\n..." fillcolor="#1a3a1a" fontcolor="white"]
+        }
+
+        subgraph cluster_f_embed {
+            label="Embed Subprocesses  (spawn)" fontcolor="#aaaaee" fontsize=10
+            color="#334466" style=dashed
+            f_e0 [label="Embed-0\ncuda:0\nbge-m3 loaded" fillcolor="#1a1a4a" fontcolor="white"]
+            f_e1 [label="Embed-1\ncuda:1\nbge-m3 loaded" fillcolor="#1a1a4a" fontcolor="white"]
+        }
+
+        f_success [label="BOTH GPUs ACTIVE\n88% + 100% utilization\nProgress bar advancing"
+                   fillcolor="#1a4a1a" fontcolor="#88ffaa" shape=diamond]
+
+        f_main_t  -> f_proxies   [label="put(batch)"]
+        f_proxies -> f_mgr       [label="socket" color="#44aaee"]
+        f_mgr     -> f_e0        [label="socket" color="#44aaee"]
+        f_mgr     -> f_e1        [label="socket" color="#44aaee"]
+        f_e0      -> f_mgr       [label="results" color="#44ee88"]
+        f_e1      -> f_mgr       [label="results" color="#44ee88"]
+        f_mgr     -> f_coll_t    [label="results" color="#44ee88"]
+        f_main_t  -> f_fork_pt   [label="creates Pool()"]
+        f_fork_pt -> f_w0        [label="fork()\ninherits socket fd only" color="#44aa44"]
+        f_fork_pt -> f_w1        [label="fork()" color="#44aa44"]
+        f_w0 -> f_success        [color="#44cc44"]
+        f_w1 -> f_success        [color="#44cc44"]
+    }
+}

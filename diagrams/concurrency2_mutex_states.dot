@@ -1,0 +1,65 @@
+digraph Concurrency2_Mutex_States {
+    graph [
+        label="Futex / threading.Lock State Machine\n(Linux PTHREAD_MUTEX_DEFAULT — used by Python's threading.Lock)"
+        labelloc=t
+        fontname="Helvetica" fontsize=14
+        bgcolor="#1a1a2e" fontcolor="#e0e0e0"
+        rankdir=TB splines=curved
+        pad=0.8 nodesep=1.2 ranksep=1.4
+    ]
+    node [fontname="Helvetica" fontsize=11 style=filled shape=ellipse]
+    edge [fontname="Helvetica" fontsize=10 color="#aaaaaa" fontcolor="#cccccc"]
+
+    UNLOCKED [label="UNLOCKED\nfutex word = 0\nno owner"
+              fillcolor="#1a4a1a" fontcolor="white" penwidth=2 color="#44cc44"]
+
+    LOCKED_NW [label="LOCKED\n(no waiters)\nfutex word = 1\nowned by thread T"
+               fillcolor="#4a3a00" fontcolor="white" penwidth=2 color="#cc8800"]
+
+    LOCKED_W [label="LOCKED\n(waiters sleeping)\nfutex word = 2\nowned by T\nN threads in kernel wait"
+              fillcolor="#5a2200" fontcolor="white" penwidth=2 color="#cc4400"]
+
+    ORPHANED [label="ORPHANED\nfutex word = 1 (or 2)\n\"owned\" by tid that\nno longer exists\nNO EXIT POSSIBLE"
+              fillcolor="#660000" fontcolor="#ffaaaa" penwidth=3 color="#ff2222"
+              shape=diamond fontsize=10]
+
+    note_orphaned [label="ps wchan = futex_\nCPU = 0%\nGPU = 0%\nwall clock → ∞"
+                   fillcolor="#2a0000" fontcolor="#ff8888" shape=box style="filled,dashed"
+                   fontsize=9]
+
+    note_kernel [label="futex(FUTEX_WAIT) syscall:\nthread sleeps in kernel\nuntil word changes"
+                 fillcolor="#1a1a3a" fontcolor="#8888cc" shape=box style="filled,dashed"
+                 fontsize=9]
+
+    note_release [label="futex(FUTEX_WAKE) syscall:\nwrite word=0, wake one waiter\n(or write word=1 if waiter\npicks up lock immediately)"
+                  fillcolor="#1a1a3a" fontcolor="#8888cc" shape=box style="filled,dashed"
+                  fontsize=9]
+
+    UNLOCKED -> LOCKED_NW [label="acquire()\nCAS: 0→1\n(atomic, no syscall)"
+                            color="#44cc44" fontcolor="#88ee88"]
+
+    LOCKED_NW -> UNLOCKED [label="release() by T\nwrite word=0"
+                            color="#cc8800" fontcolor="#eeaa44"]
+
+    LOCKED_NW -> LOCKED_W [label="another thread calls\nacquire(), word≠0\n→ futex(WAIT) syscall\nthread sleeps in kernel"
+                            color="#cc4400" fontcolor="#ee8844"]
+
+    LOCKED_W -> LOCKED_NW [label="release() by T\nwrite word=1\nwake one waiter\n(waiter acquires)"
+                            color="#cc4400" fontcolor="#ee8844"]
+
+    LOCKED_W -> UNLOCKED  [label="release() by T\nno waiters woke\nwrite word=0"
+                            color="#cc8800" fontcolor="#eeaa44" style=dashed]
+
+    LOCKED_NW -> ORPHANED [label="fork() in child\n(tid=T not inherited)\nword still = 1"
+                            color="#ff2222" fontcolor="#ff6666" style=bold penwidth=2]
+
+    LOCKED_W -> ORPHANED  [label="fork() in child\nword still = 2\nN virtual waiters\nalso unreachable"
+                            color="#ff2222" fontcolor="#ff6666" style=bold penwidth=2]
+
+    ORPHANED -> note_orphaned [style=dashed color="#ff4444" arrowhead=none]
+    LOCKED_NW -> note_kernel  [style=invis]
+    UNLOCKED -> note_release  [style=invis]
+
+    note_kernel   [pos="3,0!"]
+    note_release  [pos="0,0!"]
+}

@@ -1,0 +1,124 @@
+digraph Concurrency5_IPC_Topology {
+    graph [
+        label="sort_docs.py  —  Production IPC Topology\n(dual-GPU subprocess mode with Manager queues)"
+        labelloc=t
+        fontname="Helvetica" fontsize=14
+        bgcolor="#1a1a2e" fontcolor="#e0e0e0"
+        rankdir=TB splines=ortho
+        pad=0.8 nodesep=0.6 ranksep=1.1
+    ]
+    node [fontname="Helvetica" fontsize=10 style=filled shape=box]
+    edge [fontname="Helvetica" fontsize=9 color="#aaaaaa" fontcolor="#cccccc"]
+
+    subgraph cluster_main {
+        label="Main Process  (Python sort_docs.py)" fontcolor="#e0e0e0" fontsize=12
+        color="#334455" style=filled fillcolor="#0e1018"
+
+        subgraph cluster_main_threads {
+            label="Threads" fontcolor="#cccccc" fontsize=10
+            color="#445566" style=dashed
+            main_loop   [label="Main Thread\nimap_unordered() extraction loop\nround-robin batch dispatch"
+                         fillcolor="#2a3a4a" fontcolor="white"]
+            coll_thread [label="Collector Thread\ndrains out_q[0], out_q[1]\n→ all_results[]"
+                         fillcolor="#2a3a4a" fontcolor="white"]
+        }
+
+        subgraph cluster_proxies {
+            label="Manager Proxy Objects  (socket fds — no mutexes)" fontcolor="#88aaee" fontsize=10
+            color="#335566" style=dashed
+            in_q0_p  [label="in_q[0] proxy\n→ Manager server" fillcolor="#1a2a4a" fontcolor="white" shape=cylinder]
+            in_q1_p  [label="in_q[1] proxy\n→ Manager server" fillcolor="#1a2a4a" fontcolor="white" shape=cylinder]
+            out_q0_p [label="out_q[0] proxy\n→ Manager server" fillcolor="#1a2a4a" fontcolor="white" shape=cylinder]
+            out_q1_p [label="out_q[1] proxy\n→ Manager server" fillcolor="#1a2a4a" fontcolor="white" shape=cylinder]
+        }
+
+        all_results [label="all_results[]\n(in-process list)\nfinal CSV source"
+                     fillcolor="#334444" fontcolor="white" shape=cylinder]
+
+        main_loop -> in_q0_p [label="even batches\n{path:text} × 512" color="#88aaee"]
+        main_loop -> in_q1_p [label="odd batches"  color="#88aaee"]
+        coll_thread -> out_q0_p [label="poll(timeout=0.05)" color="#44ee88"]
+        coll_thread -> out_q1_p [label="poll(timeout=0.05)" color="#44ee88"]
+        coll_thread -> all_results [label="extend(rows)" color="#44ee88"]
+    }
+
+    subgraph cluster_manager {
+        label="Manager Server Process  (mp.Manager() — spawned at startup)" fontcolor="#88aaee" fontsize=12
+        color="#334466" style=filled fillcolor="#0e0e18"
+
+        mgr_note [label="Spawned process\n(not forked)\nOwns all Queue data\nCommunicates via socket only\n\nNo mutex state in main process\n→ fork-safe for extraction Pool"
+                  fillcolor="#2a2a5a" fontcolor="#aaaaee" shape=note]
+
+        in_q0_s  [label="in_q[0]  data store" fillcolor="#1a1a4a" fontcolor="white" shape=cylinder]
+        in_q1_s  [label="in_q[1]  data store" fillcolor="#1a1a4a" fontcolor="white" shape=cylinder]
+        out_q0_s [label="out_q[0] data store" fillcolor="#1a1a4a" fontcolor="white" shape=cylinder]
+        out_q1_s [label="out_q[1] data store" fillcolor="#1a1a4a" fontcolor="white" shape=cylinder]
+    }
+
+    subgraph cluster_embed {
+        label="Embed Subprocesses  (mp.get_context('spawn'))" fontcolor="#88ccee" fontsize=12
+        color="#1a3a4a" style=filled fillcolor="#08100e"
+
+        subgraph cluster_e0 {
+            label="Embed-0  (cuda:0 — RTX 5080)" fontcolor="#88cc88" fontsize=11
+            color="#2a4a3a" style=dashed
+            e0_model [label="bge-m3\n~5-6 GB VRAM\ncuda:0" fillcolor="#1a3a2a" fontcolor="white"]
+            e0_clf   [label="clf (64-class LR)\nloaded independently" fillcolor="#1a2a2a" fontcolor="white"]
+            e0_loop  [label="while True:\n  batch = in_q[0].get()\n  vecs = encoder.encode()\n  probas = clf.predict_proba()\n  out_q[0].put(rows)"
+                      fillcolor="#1a3a2a" fontcolor="white" shape=note]
+        }
+
+        subgraph cluster_e1 {
+            label="Embed-1  (cuda:1 — RTX 3080)" fontcolor="#88cc88" fontsize=11
+            color="#2a4a3a" style=dashed
+            e1_model [label="bge-m3\n~5-6 GB VRAM\ncuda:1" fillcolor="#1a3a2a" fontcolor="white"]
+            e1_clf   [label="clf (64-class LR)\nloaded independently" fillcolor="#1a2a2a" fontcolor="white"]
+            e1_loop  [label="while True:\n  batch = in_q[1].get()\n  vecs = encoder.encode()\n  probas = clf.predict_proba()\n  out_q[1].put(rows)"
+                      fillcolor="#1a3a2a" fontcolor="white" shape=note]
+        }
+    }
+
+    subgraph cluster_workers {
+        label="Extraction Pool  (mp.Pool, fork — 12 workers)" fontcolor="#ccaa66" fontsize=12
+        color="#4a3a00" style=filled fillcolor="#110e00"
+
+        fork_note [label="Forked from main process\n✓ inherit socket fd (Manager proxy)\n✗ inherit NO mutex state\n→ fork-safe"
+                   fillcolor="#3a2a00" fontcolor="#eecc88" shape=note]
+
+        w0 [label="Worker 0\n_extract_cpu(path)\nfitz.get_text()\n→ (path, text)" fillcolor="#2a2a00" fontcolor="white"]
+        w1 [label="Worker 1" fillcolor="#2a2a00" fontcolor="white"]
+        w2 [label="Worker 2" fillcolor="#2a2a00" fontcolor="white"]
+        wdots [label="Workers 3-11\n..." fillcolor="#1a1a00" fontcolor="#aaaaaa"]
+    }
+
+    subgraph cluster_source {
+        label="Source Corpus" fontcolor="#cccccc" fontsize=11
+        color="#444444" style=dashed
+        src [label="/media/.../usafa_af_mil/\n26,577 PDFs" fillcolor="#333333" fontcolor="white" shape=folder]
+    }
+
+    subgraph cluster_output {
+        label="Output" fontcolor="#cccccc" fontsize=11
+        color="#444444" style=dashed
+        csv [label="usafa_sorted/\nsort_report.csv\n26,577 rows + header" fillcolor="#333333" fontcolor="white" shape=note]
+    }
+
+    src   -> w0 [label="file paths\n(imap_unordered)" color="#ccaa44"]
+    src   -> w1 [color="#ccaa44" style=dashed]
+    src   -> w2 [color="#ccaa44" style=dashed]
+    w0 -> main_loop [label="(path, text)\nvia Pool pipe" color="#ccaa44"]
+    w1 -> main_loop [color="#ccaa44" style=dashed]
+    w2 -> main_loop [color="#ccaa44" style=dashed]
+
+    in_q0_p -> in_q0_s [label="socket" color="#88aaee"]
+    in_q1_p -> in_q1_s [label="socket" color="#88aaee"]
+    in_q0_s -> e0_loop  [label="socket" color="#88aaee"]
+    in_q1_s -> e1_loop  [label="socket" color="#88aaee"]
+
+    e0_loop -> out_q0_s [label="socket\nresult rows" color="#44ee88"]
+    e1_loop -> out_q1_s [label="socket\nresult rows" color="#44ee88"]
+    out_q0_s -> out_q0_p [label="socket" color="#44ee88"]
+    out_q1_s -> out_q1_p [label="socket" color="#44ee88"]
+
+    all_results -> csv [label="write CSV\nat completion" color="#aaaaaa"]
+}

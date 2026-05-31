@@ -1,0 +1,94 @@
+digraph Concurrency1_Fork_Feeder_Deadlock {
+    graph [
+        label="Fork-After-Threads: How a Locked Feeder Mutex Deadlocks Child Workers"
+        labelloc=t
+        fontname="Helvetica" fontsize=15
+        bgcolor="#1a1a2e" fontcolor="#e0e0e0"
+        rankdir=LR splines=ortho
+        pad=0.7 nodesep=0.5 ranksep=1.4
+    ]
+    node [fontname="Helvetica" fontsize=10 style=filled shape=box]
+    edge [fontname="Helvetica" fontsize=9 color="#aaaaaa" fontcolor="#cccccc"]
+
+    subgraph cluster_before {
+        label="Parent Process  (before fork)" fontcolor="#88cc88" fontsize=12
+        color="#334433" style=filled fillcolor="#0e1a0e"
+
+        subgraph cluster_threads_before {
+            label="Thread Table" fontcolor="#cccccc" fontsize=10
+            color="#445544" style=dashed
+            main_t [label="Main Thread\ntid=1\n(running)" fillcolor="#2a4a2a" fontcolor="white"]
+            feeder_t [label="Feeder Thread\ntid=2\n→ writing to pipe" fillcolor="#3a5a2a" fontcolor="white"]
+        }
+
+        subgraph cluster_mem_before {
+            label="Process Memory" fontcolor="#cccccc" fontsize=10
+            color="#445544" style=dashed
+            mutex_m [label="Mutex M\nfutex word = 1\n(LOCKED, no waiters)\nowner: tid=2"
+                     fillcolor="#6a3300" fontcolor="white" shape=hexagon]
+            pipe_buf [label="Pipe write buffer\n(in-flight data)" fillcolor="#2a3a5a" fontcolor="white"]
+        }
+
+        subgraph cluster_fd_before {
+            label="File Descriptor Table" fontcolor="#cccccc" fontsize=10
+            color="#445544" style=dashed
+            fd_pipe [label="fd 3 → pipe_write\nfd 4 → socket" fillcolor="#2a2a4a" fontcolor="white"]
+        }
+
+        feeder_t -> mutex_m [label="holds lock" color="#ff8800" fontcolor="#ff8800" style=bold]
+        feeder_t -> pipe_buf [label="writing" color="#44aa44"]
+        feeder_t -> fd_pipe  [label="uses" style=dashed]
+    }
+
+    fork_event [label="fork()\nCOPY memory\nDO NOT copy threads"
+                fillcolor="#445500" fontcolor="white" shape=octagon
+                fontsize=11]
+
+    subgraph cluster_parent_after {
+        label="Parent  (after fork)" fontcolor="#88cc88" fontsize=12
+        color="#334433" style=filled fillcolor="#0e1a0e"
+        pm [label="Main Thread (tid=1)\nFeeder Thread (tid=2)\n\nfeeder eventually releases M\nfutex word → 0"
+            fillcolor="#2a4a2a" fontcolor="white"]
+    }
+
+    subgraph cluster_child {
+        label="Child Process  (after fork)" fontcolor="#cc6666" fontsize=12
+        color="#4a1a1a" style=filled fillcolor="#1a0e0e"
+
+        subgraph cluster_child_threads {
+            label="Thread Table — ONLY main thread survived" fontcolor="#ff8866" fontsize=10
+            color="#663333" style=dashed
+            child_main [label="Main Thread\ntid=1\n(running)" fillcolor="#3a2a2a" fontcolor="white"]
+            no_feeder  [label="tid=2  DOES NOT EXIST\n(fork does not copy threads)"
+                        fillcolor="#2a1a1a" fontcolor="#888888" style=dashed shape=box]
+        }
+
+        subgraph cluster_child_mem {
+            label="Process Memory — COPY of parent at fork instant" fontcolor="#ff8866" fontsize=10
+            color="#663333" style=dashed
+            child_mutex [label="Mutex M  (INHERITED COPY)\nfutex word = 1\n(LOCKED — inherited value)\nowner: tid=2  ← tid=2 does not exist!"
+                         fillcolor="#881a00" fontcolor="white" shape=hexagon]
+            child_pipe  [label="Pipe write buffer\n(copy — not shared)" fillcolor="#2a1a2a" fontcolor="#888888"]
+        }
+
+        subgraph cluster_child_fd {
+            label="File Descriptor Table — DUPLICATED (fork-safe)" fontcolor="#88cc88" fontsize=10
+            color="#334433" style=dashed
+            child_fd [label="fd 3 → pipe_write (shared kernel obj)\nfd 4 → socket  (shared kernel obj)"
+                      fillcolor="#2a3a2a" fontcolor="white"]
+        }
+
+        deadlock [label="Pool worker tries Pool.imap_unordered()\n→ internal lock acquire\n→ futex(WAIT) on Mutex M\n→ kernel waits for word=0\n→ NOBODY WILL WRITE 0\n→ DEADLOCK FOREVER\n\nps wchan: futex_\nCPU: 0%,  GPU: 0%"
+                  fillcolor="#660000" fontcolor="#ffcccc" shape=diamond fontsize=9]
+
+        child_main -> child_mutex [label="tries to acquire" color="#ff4444" style=bold]
+        child_mutex -> deadlock   [label="word=1 → kernel WAIT" color="#ff4444" style=bold]
+        child_fd    -> child_main [label="socket fd (safe)" color="#44aa44" style=dashed]
+    }
+
+    main_t  -> fork_event [color="#88cc88"]
+    fork_event -> pm          [label="parent continues" color="#88cc88"]
+    fork_event -> child_main  [label="child gets\nonly this thread" color="#cc6666"]
+    fork_event -> child_mutex [label="memory COPIED\n(including locked futex word)" color="#ff8800" fontcolor="#ff8800"]
+    fork_event -> child_fd    [label="fds DUPLICATED\n(fork-safe)" color="#44aa44"]
+}
