@@ -60,6 +60,22 @@ def _handle_signal(signum, frame):
 signal.signal(signal.SIGINT,  _handle_signal)
 signal.signal(signal.SIGTERM, _handle_signal)
 
+
+def _silence_child_signals():
+    """Reset signal handling in a child process/worker.
+
+    Only the MAIN process should run the graceful-shutdown handler. Without this,
+    fork workers inherit (and spawn subprocesses re-register, via module import)
+    _handle_signal — so when the Pool sends SIGTERM at normal teardown, every
+    worker prints the alarming '⚠ Ctrl-C — finishing current window' banner.
+    Children ignore SIGINT (the main process coordinates an orderly shutdown via
+    queue sentinels) and take the default action on SIGTERM (clean termination)."""
+    try:
+        signal.signal(signal.SIGINT,  signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    except Exception:
+        pass
+
 from doc_classifier_gpu import (
     _extract_cpu,
     _gpu_stat,
@@ -215,6 +231,8 @@ def _embed_proc_fn(in_q, out_q, embed_model, clf_path, chunk_chars,
     SentenceTransformer instances are loaded in the same process.
     Receives {Path: text} dicts, emits [(Path,cls,conf,sec_cls,sec_conf)] lists.
     """
+    _silence_child_signals()   # spawn re-imports this module, re-registering the
+                               # graceful handler; reset it so only main handles Ctrl-C
     from sentence_transformers import SentenceTransformer
 
     try:
@@ -299,6 +317,7 @@ _WORKER_EXTRACT_Q = None
 def _worker_init(extract_q):
     """Pool initializer: stash the Manager extract queue as a worker-global."""
     global _WORKER_EXTRACT_Q
+    _silence_child_signals()
     _WORKER_EXTRACT_Q = extract_q
 
 
@@ -462,8 +481,10 @@ def main():
     # CORRECTNESS §4a.
     manager   = mp.Manager()
     extract_q = manager.Queue()
+    procs     = []   # embed subprocesses (dual-GPU); cleaned up in finally below
 
-    with _make_progress() as progress:
+    try:
+      with _make_progress() as progress:
         task_extract = progress.add_task(
             f"[cyan]CPU extract[/] ({args.workers}w maxtasks={args.maxtasks})",
             total=len(all_files))
@@ -593,7 +614,20 @@ def main():
                     p.terminate()
             collector.join()         # wait for all results to be merged
 
-        manager.shutdown()           # tear down the Manager server (both modes)
+    finally:
+        # Safety net: on abnormal exit the spawned embed subprocesses can outlive
+        # the parent and keep holding VRAM (their shutdown sentinels were never
+        # sent). Terminate any survivors, then tear down the Manager server.
+        for p in procs:
+            try:
+                if p.is_alive():
+                    p.terminate()
+            except Exception:
+                pass
+        try:
+            manager.shutdown()
+        except Exception:
+            pass
 
     elapsed = time.time() - t0_total
     total_extracted = len(all_results)
