@@ -222,8 +222,9 @@ def main():
                         help="skip GPU OCR — image-only files go to _review/ (fast)")
     parser.add_argument("--max-ocr-pages", type=int, default=0,
                         help="limit OCR to first N pages (0=all)")
-    parser.add_argument("--single-gpu", action="store_true",
-                        help="disable dual-GPU embedding (use only the best single GPU)")
+    parser.add_argument("--single-gpu", action="store_true", default=True,
+                        help="use only the best single GPU (default: on; --no-single-gpu for dual)")
+    parser.add_argument("--no-single-gpu", dest="single_gpu", action="store_false")
     args = parser.parse_args()
 
     source  = Path(args.source)
